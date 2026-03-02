@@ -43,5 +43,7 @@
   "predictor_layers": 2,
   "predictor_n_heads": 6,
   "predictor_mlp_ratio": 4.0,
-  "mask_token_init_std": 0.02
+  "mask_token_init_std": 0.02,
+  "attn_qk_norm": "l2",
+  "vicreg_weight": 0.0
 }
