@@ -12,6 +12,7 @@ import shutil
 import torch
 
 from contextlib import contextmanager
+from torch.utils.data import IterableDataset
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 try:
@@ -640,7 +641,7 @@ class LRUShardCache:
                     break
 
 
-class ShapeBatcher:
+class ShapeBatcher(IterableDataset):
     """
     (C,P) 완전 동일 shape 기준으로 배치 생성:
       key = (n_channels, n_patches)
@@ -809,7 +810,7 @@ class ShapeBatcher:
                 for out in _flush_key(k):
                     yield out
 
-class AdaptiveTokenBucketBatcher:
+class AdaptiveTokenBucketBatcher(IterableDataset):
     """
     NEW(C): token-length bucket batching + greedy packing
     - bucket 내에서 sum(valid_tokens)가 tokens_per_batch를 크게 초과하지 않게
