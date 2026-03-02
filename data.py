@@ -45,27 +45,34 @@ def find_shards(data_root: str, shard_glob: str) -> List[str]:
 
 
 def _as_torch(x: Any) -> torch.Tensor:
+    """Convert decoded WebDataset field into a torch.Tensor.
+
+    WebDataset decoding behavior differs by version. In some versions, `.npy` fields
+    may remain as raw bytes. We handle:
+      - torch.Tensor
+      - np.ndarray
+      - bytes/bytearray containing .npy (or .npz) payload
+    """
     if isinstance(x, torch.Tensor):
         return x
     if isinstance(x, np.ndarray):
         return torch.from_numpy(x)
+    if isinstance(x, (bytes, bytearray)):
+        bio = io.BytesIO(x)
+        arr = np.load(bio, allow_pickle=False)
+        # Support .npz just in case (shouldn't happen in our pipeline).
+        if isinstance(arr, np.lib.npyio.NpzFile):
+            if len(arr.files) == 0:
+                raise ValueError("Empty NPZ payload")
+            arr = arr[arr.files[0]]
+        return torch.from_numpy(arr)
     raise TypeError(type(x))
 
 
 def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
-    # Robust decode: depending on webdataset version/decoder, values may still be raw bytes.
-    def _maybe_np_load(v: Any) -> Any:
-        if isinstance(v, memoryview):
-            v = v.tobytes()
-        if isinstance(v, (bytes, bytearray)):
-            return np.load(io.BytesIO(v), allow_pickle=False)
-        return v
-
-    eeg = _maybe_np_load(sample[EEG_KEY])
-    coord = _maybe_np_load(sample[COORD_KEY])
+    eeg = sample[EEG_KEY]
+    coord = sample[COORD_KEY]
     meta = sample.get(META_KEY, {})
-    if isinstance(meta, memoryview):
-        meta = meta.tobytes()
     if isinstance(meta, (bytes, bytearray)):
         meta = json.loads(meta.decode("utf-8"))
 
@@ -88,6 +95,30 @@ def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     # coord = coord / (coord.norm(dim=-1).mean().clamp_min(1e-6))
 
     return {"eeg": eeg, "coord": coord, "meta": meta}
+
+def _flatmap_stage(mapper):
+    """Compatibility replacement for `webdataset.flatmap` (not present in some versions).
+
+    `mapper` should return either:
+      - a single sample dict
+      - an iterable (e.g., list) of sample dicts
+      - None (to drop the sample)
+    The returned object is an iterator->iterator pipeline stage compatible with `wds.DataPipeline`.
+    """
+    def _iter(src):
+        for ex in src:
+            out = mapper(ex)
+            if out is None:
+                continue
+            if isinstance(out, dict):
+                yield out
+            else:
+                for y in out:
+                    if y is None:
+                        continue
+                    yield y
+    return _iter
+
 
 
 def compute_num_patches(T: int, patch_samples: int, hop_samples: int) -> int:
@@ -953,7 +984,7 @@ def build_webdataset(
         wds.tarfile_to_samples(handler=wds.ignore_and_continue),
         # sample shuffle BEFORE decode: bytes 수준에서 섞기 (torch 텐서 단계보다 RAM 부담 적음)
         wds.shuffle(sample_shuffle),
-        (wds.decode(wds.numpy_loads, wds.json_loads) if hasattr(wds, "numpy_loads") and hasattr(wds, "json_loads") else wds.decode()),
+        wds.decode(),
         wds.map(decode_sample),  # 여기서 torch로 변환
     ]
 
@@ -964,7 +995,7 @@ def build_webdataset(
     mc_mode = str(long_multicrop_mode).lower().strip()
     if mc_mode not in ("off", "none", "disabled", "disable"):
         pipeline.append(
-            wds.flatmap(
+            _flatmap_stage(
                 lambda ex: maybe_dino_multicrop_60s(
                     ex,
                     mode=mc_mode,
@@ -988,7 +1019,7 @@ def build_webdataset(
     # NOTE: multi-crop을 켠 경우에는 split을 함께 쓰지 않는 것을 권장.
     if mc_mode in ("off", "none", "disabled", "disable"):
         if split_long_prob and split_long_prob > 0:
-            pipeline.append(wds.flatmap(lambda ex: maybe_split_long_to_base(ex, base_seconds=base_seconds, split_prob=split_long_prob)))
+            pipeline.append(_flatmap_stage(lambda ex: maybe_split_long_to_base(ex, base_seconds=base_seconds, split_prob=split_long_prob)))
 
     # small shuffle after crop/split
     pipeline += [
