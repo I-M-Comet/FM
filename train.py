@@ -53,6 +53,64 @@ def cosine_warmup(step: int, warmup: int, total: int, base_lr: float) -> float:
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
 
+def token_wcc_lr(tokens_next: int, warmup_tokens: int, total_tokens: int, cooldown_tokens: int, base_lr: float, min_lr: float = 0.0) -> float:
+    # Token-based warmup-constant-cooldown schedule.
+    # Use tokens_next (tokens after the upcoming step) to mimic (step+1)/warmup behavior.
+    t = max(0, int(tokens_next))
+    T = max(1, int(total_tokens))
+    W = max(0, int(warmup_tokens))
+    C = max(0, int(cooldown_tokens))
+
+    if W > T:
+        W = T
+    if C > (T - W):
+        C = max(0, T - W)
+
+    stable = max(0, T - W - C)
+
+    if W > 0 and t < W:
+        return float(base_lr) * float(t) / float(max(1, W))
+
+    if t < (W + stable):
+        return float(base_lr)
+
+    if C > 0 and t < T:
+        td = t - (W + stable)
+        frac = float(td) / float(max(1, C))
+        return float(base_lr) + (float(min_lr) - float(base_lr)) * frac
+
+    return float(min_lr)
+
+
+def vicreg_var_cov_loss(
+    x: torch.Tensor,
+    gamma: float = 1.0,
+    var_weight: float = 1.0,
+    cov_weight: float = 1.0,
+    eps: float = 1e-4,
+):
+    # VICReg-style variance + covariance regularizer (no invariance term here).
+    # x: (N,D)
+    assert x.dim() == 2, f"expected (N,D), got {tuple(x.shape)}"
+    N, D = x.shape
+    if N <= 1:
+        z = torch.zeros((), device=x.device, dtype=x.dtype)
+        return z, z, z
+
+    x = x - x.mean(dim=0, keepdim=True)
+
+    std = torch.sqrt(x.var(dim=0, unbiased=False) + eps)
+    var = torch.mean(F.relu(float(gamma) - std))
+
+    cov_m = (x.T @ x) / float(max(1, N - 1))
+    eye = torch.eye(D, device=x.device, dtype=torch.bool)
+    off = cov_m.masked_select(~eye)
+    cov = (off ** 2).mean()
+
+    tot = float(var_weight) * var + float(cov_weight) * cov
+    return tot, var, cov
+
+
 def ema_momentum_schedule(step: int, total: int, m0: float, m1: float) -> float:
     progress = step / max(1, total)
     m = m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress)))
@@ -402,23 +460,6 @@ def main():
     if args.no_cudnn_benchmark:
         train_cfg.cudnn_benchmark = False
 
-    # ---- seed fixing (recommended for tuning/ablations) ----
-    seed = int(getattr(train_cfg, "seed", 42))
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    set_seed(seed, device_specific=True)
-
-    if bool(getattr(train_cfg, "torch_deterministic", False)):
-        # WARNING: may reduce throughput and can raise errors for some ops.
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    else:
-        torch.backends.cudnn.benchmark = bool(getattr(train_cfg, "cudnn_benchmark", True))
-
     # overrides
     if args.data_root is not None: train_cfg.data_root = args.data_root
     if args.cache_dir is not None: train_cfg.cache_dir = args.cache_dir
@@ -475,7 +516,9 @@ def main():
     grad_accum_steps = 1 if use_token_budget else int(train_cfg.grad_accum_steps)
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=grad_accum_steps,
+        # NOTE: we implement manual accumulation (token-budget or micro) in the training loop.
+        # Keep accelerate's internal grad-accum at 1 to avoid accidental double-scaling.
+        gradient_accumulation_steps=1,
         mixed_precision=train_cfg.mixed_precision,
         log_with="wandb" if train_cfg.use_wandb else None,
         project_dir=train_cfg.output_dir,
@@ -494,6 +537,23 @@ def main():
         )
 
     set_torch_flags_for_sdp()
+
+    # ---- seed fixing (recommended for tuning/ablations) ----
+    seed = int(getattr(train_cfg, "seed", 42))
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    set_seed(seed, device_specific=True)
+
+    if bool(getattr(train_cfg, "torch_deterministic", False)):
+        # WARNING: may reduce throughput and can raise errors for some ops.
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.benchmark = bool(getattr(train_cfg, "cudnn_benchmark", True))
 
     # models (move to device before dataloader to allow auto-tune)
     student = EEGEncoder(model_cfg).to(accelerator.device)
@@ -649,6 +709,16 @@ def main():
     accum_micro = 0
     accum_bucket_keys = set()
 
+    # token-based LR schedule state (optional)
+    lr_sched = str(getattr(train_cfg, "lr_schedule", "cosine")).lower().strip()
+    if lr_sched == "token_wcc" and (not use_token_budget or budget_tokens <= 0):
+        if accelerator.is_main_process:
+            print("[warn] lr_schedule=token_wcc requires token-budget accumulation (tokens_per_update>0). Falling back to cosine.")
+        lr_sched = "cosine"
+
+    tokens_seen_total = int(resume_step) * int(budget_tokens) if (resume_state_dir and lr_sched == "token_wcc") else 0
+    accum_tokens_eff = 0  # effective tokens accumulated in the current optimizer update
+
     # cheap proxy accumulators (per optimizer step)
     proxy_enabled = bool(getattr(train_cfg, "log_proxies", True))
     if proxy_enabled:
@@ -662,6 +732,15 @@ def main():
         proxy_last_pred_feat_std = torch.zeros((), device=dev, dtype=torch.float32)
         proxy_last_tgt_feat_std = torch.zeros((), device=dev, dtype=torch.float32)
         proxy_last_cos_mean = torch.zeros((), device=dev, dtype=torch.float32)
+
+    # VICReg logging accumulators (per optimizer step)
+    vic_log = float(getattr(train_cfg, "vicreg_weight", 0.0) or 0.0) > 0
+    if vic_log:
+        dev = accelerator.device
+        vic_loss_sum = torch.zeros((), device=dev, dtype=torch.float32)
+        vic_var_sum = torch.zeros((), device=dev, dtype=torch.float32)
+        vic_cov_sum = torch.zeros((), device=dev, dtype=torch.float32)
+        vic_w_sum = torch.zeros((), device=dev, dtype=torch.float32)
 
     # ------------------------------------------------------------
     # Optional: "true" multi-view training for long multi-crops
@@ -689,7 +768,7 @@ def main():
         x = batch["eeg"]          # (B,C,T)
         coords = batch["coord"]   # (B,C,3)
         metas = batch.get("meta", None)  # optional list[dict]
-        x = rescale_small_segments(x, target_rms=1.0, rms_low=-0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
+        x = rescale_small_segments(x, target_rms=1.0, rms_low=0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
         n_channels = batch["n_channels"].to(x.device)
         n_patches = batch["n_patches"].to(x.device)
         B, C_max, _ = x.shape
@@ -754,6 +833,13 @@ def main():
 
         # DDP gradient sync control
         no_sync = manual_accum and (not will_step) and (accelerator.num_processes > 1)
+
+        # effective tokens contributed by this micro-batch (used for token-based LR schedule + regularizers)
+        tokens_eff_this = int(tokens_this)
+        if manual_accum and use_token_budget and (budget_tokens > 0) and will_step:
+            remain = max(0, int(budget_tokens) - int(accum_tokens))
+            if remain > 0 and int(tokens_this) > remain:
+                tokens_eff_this = int(remain)
 
         with ExitStack() as stack:
             if no_sync:
@@ -945,6 +1031,48 @@ def main():
                             mv_scale = float(weight) / float(max(1, budget_tokens))
                     loss_scaled = loss_scaled + (mv_weight * mv_loss * float(mv_scale))
 
+                # ------------------------------------------------------------
+                # (Optional) VICReg-style variance/cov regularizer
+                # ------------------------------------------------------------
+                vic_w = float(getattr(train_cfg, "vicreg_weight", 0.0) or 0.0)
+                vic_apply = str(getattr(train_cfg, "vicreg_apply_to", "pred")).lower().strip()
+                vic_gamma = float(getattr(train_cfg, "vicreg_gamma", 1.0) or 1.0)
+                vic_var_w = float(getattr(train_cfg, "vicreg_var_weight", 1.0) or 1.0)
+                vic_cov_w = float(getattr(train_cfg, "vicreg_cov_weight", 1.0) or 1.0)
+                vic_max = int(getattr(train_cfg, "vicreg_max_tokens", 0) or 0)
+
+                if vic_w > 0:
+                    if vic_apply == "ctx":
+                        valid_ctx_tmp = ~pad_ctx
+                        denom_c = valid_ctx_tmp.sum(dim=1).clamp_min(1).to(z_ctx.dtype)
+                        feats = (z_ctx * valid_ctx_tmp[..., None]).sum(dim=1) / denom_c[:, None]  # (B,D)
+                        feats = feats.float()
+                    else:
+                        feats = pred_tgt[valid_tgt].float()  # (Nt,D)
+
+                    if vic_max > 0 and feats.shape[0] > vic_max:
+                        idx = torch.randperm(feats.shape[0], device=feats.device)[:vic_max]
+                        feats = feats.index_select(0, idx)
+
+                    base, vvar, vcov = vicreg_var_cov_loss(feats, gamma=vic_gamma, var_weight=vic_var_w, cov_weight=vic_cov_w)
+                    vic_loss = vic_w * base
+
+                    # scale to be invariant to #micro-batches per optimizer update
+                    reg_scale = 1.0
+                    if manual_accum:
+                        if use_token_budget:
+                            reg_scale = float(tokens_eff_this) / float(max(1, budget_tokens))
+                        else:
+                            reg_scale = float(weight) / float(max(1, budget_tokens))
+
+                    loss_scaled = loss_scaled + vic_loss * float(reg_scale)
+
+                    if 'vic_log' in locals() and vic_log:
+                        vic_loss_sum += vic_loss.detach().float() * float(reg_scale)
+                        vic_var_sum += vvar.detach().float() * float(reg_scale)
+                        vic_cov_sum += vcov.detach().float() * float(reg_scale)
+                        vic_w_sum += float(reg_scale)
+
                 # ---------------------------------
                 # Cheap proxy stats (logged on optimizer step)
                 # ---------------------------------
@@ -983,6 +1111,7 @@ def main():
         # update accumulation stats
         if manual_accum:
             accum_tokens += int(tokens_this)
+            accum_tokens_eff += int(tokens_eff_this)
             accum_micro += 1
             accum_bucket_keys.add(bucket_key)
 
@@ -999,12 +1128,33 @@ def main():
                     train_cfg.grad_clip,
                 )
 
-            lr = cosine_warmup(global_step, train_cfg.warmup_steps, train_cfg.max_steps, train_cfg.lr)
+            # LR schedule (baseline: cosine over steps; optional: token-based WCC)
+            if lr_sched == "token_wcc":
+                tpu = int(budget_tokens)
+                total_toks = int(getattr(train_cfg, "lr_total_tokens", 0) or 0)
+                warm_toks = int(getattr(train_cfg, "lr_warmup_tokens", 0) or 0)
+                cool_toks = int(getattr(train_cfg, "lr_cooldown_tokens", 0) or 0)
+                min_lr = float(getattr(train_cfg, "min_lr", 0.0) or 0.0)
+
+                if total_toks <= 0:
+                    total_toks = int(train_cfg.max_steps) * max(1, tpu)
+                if warm_toks <= 0:
+                    warm_toks = int(train_cfg.warmup_steps) * max(1, tpu)
+                if cool_toks <= 0:
+                    frac = float(getattr(train_cfg, "lr_cooldown_frac", 0.10) or 0.10)
+                    cool_toks = int(frac * float(total_toks))
+
+                tokens_next = int(tokens_seen_total) + int(accum_tokens_eff)
+                lr = token_wcc_lr(tokens_next, warm_toks, total_toks, cool_toks, train_cfg.lr, min_lr)
+            else:
+                lr = cosine_warmup(global_step, train_cfg.warmup_steps, train_cfg.max_steps, train_cfg.lr)
             for pg in opt.param_groups:
                 pg["lr"] = lr
 
             opt.step()
             opt.zero_grad(set_to_none=True)
+            if lr_sched == "token_wcc":
+                tokens_seen_total = int(tokens_seen_total) + int(accum_tokens_eff)
 
             m = ema_momentum_schedule(global_step, train_cfg.max_steps, train_cfg.ema_momentum, train_cfg.ema_momentum_final)
             update_ema(teacher=accelerator.unwrap_model(teacher), student=accelerator.unwrap_model(student), m=m)
@@ -1025,8 +1175,12 @@ def main():
                     "loss_tgt_mean": float(loss_log.detach().cpu().item()),
                     "loss_scaled": float(loss_scaled.detach().cpu().item()),
                     "lr": lr,
+                    "tokens_seen_total": int(tokens_seen_total) if lr_sched == "token_wcc" else 0,
                     "ema_m": m,
                     "grad_norm": float(grad_norm.detach().cpu().item()) if grad_norm is not None else 0.0,
+                    "vicreg_loss": float((vic_loss_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
+                    "vicreg_var": float((vic_var_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
+                    "vicreg_cov": float((vic_cov_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
                     "ctx_tokens_max": int((~pad_ctx).sum(dim=1).max().detach().cpu().item()),
                     "tgt_tokens_max": int((~pad_tgt).sum(dim=1).max().detach().cpu().item()),
                     "ctx_tokens_sum": int((~pad_ctx).sum().detach().cpu().item()),
@@ -1100,6 +1254,7 @@ def main():
             accum_tokens = 0
             accum_micro = 0
             accum_bucket_keys = set()
+            accum_tokens_eff = 0
 
             if proxy_enabled:
                 proxy_n.zero_()
@@ -1111,6 +1266,12 @@ def main():
                 proxy_last_pred_feat_std.zero_()
                 proxy_last_tgt_feat_std.zero_()
                 proxy_last_cos_mean.zero_()
+
+            if vic_log:
+                vic_loss_sum.zero_()
+                vic_var_sum.zero_()
+                vic_cov_sum.zero_()
+                vic_w_sum.zero_()
 
             if mv_enabled:
                 mv_pairs_sum.zero_()

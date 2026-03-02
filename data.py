@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import io
 import json
 import numpy as np
 import os
@@ -52,9 +53,19 @@ def _as_torch(x: Any) -> torch.Tensor:
 
 
 def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
-    eeg = sample[EEG_KEY]
-    coord = sample[COORD_KEY]
+    # Robust decode: depending on webdataset version/decoder, values may still be raw bytes.
+    def _maybe_np_load(v: Any) -> Any:
+        if isinstance(v, memoryview):
+            v = v.tobytes()
+        if isinstance(v, (bytes, bytearray)):
+            return np.load(io.BytesIO(v), allow_pickle=False)
+        return v
+
+    eeg = _maybe_np_load(sample[EEG_KEY])
+    coord = _maybe_np_load(sample[COORD_KEY])
     meta = sample.get(META_KEY, {})
+    if isinstance(meta, memoryview):
+        meta = meta.tobytes()
     if isinstance(meta, (bytes, bytearray)):
         meta = json.loads(meta.decode("utf-8"))
 
@@ -942,7 +953,7 @@ def build_webdataset(
         wds.tarfile_to_samples(handler=wds.ignore_and_continue),
         # sample shuffle BEFORE decode: bytes 수준에서 섞기 (torch 텐서 단계보다 RAM 부담 적음)
         wds.shuffle(sample_shuffle),
-        wds.decode(wds.numpy_loads, wds.json_loads),
+        (wds.decode(wds.numpy_loads, wds.json_loads) if hasattr(wds, "numpy_loads") and hasattr(wds, "json_loads") else wds.decode()),
         wds.map(decode_sample),  # 여기서 torch로 변환
     ]
 

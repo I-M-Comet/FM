@@ -32,6 +32,15 @@ class EEGModelConfig:
     rope_theta: float = 10000.0
     rotary_pct: float = 1.0
 
+    # --------- Attention stabilization ----------
+    # Optional QK normalization inside attention; independent of MLP/RMSNorm/LN choices.
+    # - off       : standard scaled dot-product attention
+    # - l2        : L2-normalize q/k vectors (cosine attention) with rescale
+    # - rms       : RMS-normalize q/k vectors
+    # - layernorm : LayerNorm on q/k vectors
+    attn_qk_norm: str = "off"  # off | l2 | rms | layernorm
+    attn_qk_norm_eps: float = 1e-6
+
     # --------- Encoder attention architecture ----------
     # "full"      : standard 1D packed-token self-attention
     # "divided"   : TimeSformer-like divided attention (temporal pass then spatial pass)
@@ -60,7 +69,7 @@ class EEGModelConfig:
     coord_jitter_std: float = 0.05           # applied with prob coord_jitter_prob
     coord_jitter_prob: float = 0.5
     coord_renormalize: bool = False           # renormalize coords after jitter
-    w_init: float = 0.0                      # initial value for learnable spatial bias weight
+    coord_w_init: float = 0.0                      # initial value for learnable spatial bias weight
     isFourier: bool = False
 
     # --------- Frequency features ----------
@@ -205,6 +214,28 @@ class TrainConfig:
 
     max_steps: int = 200_000
     warmup_steps: int = 5_000
+
+    # --------- LR schedule ----------
+    # Baseline: cosine warmup over steps (existing behavior)
+    # Optional: token-based WCC (warmup-constant-cooldown trapezoid) over *effective tokens*.
+    lr_schedule: str = "cosine"  # cosine | token_wcc
+    min_lr: float = 0.0
+
+    # Token-based WCC params (only used when lr_schedule=="token_wcc")
+    # If 0, they default to warmup_steps/max_steps scaled by tokens_per_update.
+    lr_total_tokens: int = 0
+    lr_warmup_tokens: int = 0
+    lr_cooldown_tokens: int = 0
+    lr_cooldown_frac: float = 0.10
+
+    # --------- VICReg-style anti-collapse regularizer (optional) ----------
+    # Adds variance/covariance penalties on student features (cheap, no extra views required).
+    vicreg_weight: float = 0.0
+    vicreg_apply_to: str = "pred"  # pred | ctx
+    vicreg_gamma: float = 1.0
+    vicreg_var_weight: float = 1.0
+    vicreg_cov_weight: float = 1.0
+    vicreg_max_tokens: int = 2048
 
     # EMA teacher
     ema_momentum: float = 0.996

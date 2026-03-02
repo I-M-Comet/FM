@@ -398,13 +398,16 @@ class SpatialBias(nn.Module):
 # Attention blocks (PreNorm) with RoPE + Flash SDP
 # ============================================================
 class MultiheadSelfAttentionRoPE(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rope_theta: float, rotary_pct: float):
+    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rope_theta: float, rotary_pct: float, qk_norm: str = "off", qk_norm_eps: float = 1e-6):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.attn_dropout = float(attn_dropout)
+
+        self.qk_norm = str(qk_norm).lower()
+        self.qk_norm_eps = float(qk_norm_eps)
 
         rotary_dim = int(self.head_dim * rotary_pct)
         rotary_dim = rotary_dim - (rotary_dim % 2)
@@ -494,6 +497,25 @@ class MultiheadSelfAttentionRoPE(nn.Module):
             q = torch.cat([q_rot, q_pass], dim=-1)
             k = torch.cat([k_rot, k_pass], dim=-1)
 
+        # Optional QK normalization (attention stability)
+        if self.qk_norm != "off":
+            eps = self.qk_norm_eps
+            if self.qk_norm == "l2":
+                q = q / (q.norm(dim=-1, keepdim=True) + eps)
+                k = k / (k.norm(dim=-1, keepdim=True) + eps)
+                # compensate SDP's internal 1/sqrt(d) scaling (so logits stay O(1))
+                scale = math.sqrt(self.head_dim)
+                q = q * scale
+                k = k * scale
+            elif self.qk_norm in ("rms", "rmsnorm"):
+                q = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + eps)
+                k = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + eps)
+            elif self.qk_norm in ("layernorm", "ln"):
+                q = F.layer_norm(q, (self.head_dim,), eps=eps)
+                k = F.layer_norm(k, (self.head_dim,), eps=eps)
+            else:
+                raise ValueError(f"Unknown attn_qk_norm: {self.qk_norm}")
+            
         attn_mask = None
         if attn_bias is None:
             # key padding only (efficient)
@@ -527,13 +549,16 @@ class CrossAttentionRoPE(nn.Module):
     Cross-attention: queries attend to context keys/values.
     RoPE is applied independently to Q and K using their time positions.
     """
-    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rope_theta: float, rotary_pct: float):
+    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rope_theta: float, rotary_pct: float, qk_norm: str = "off", qk_norm_eps: float = 1e-6):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.attn_dropout = float(attn_dropout)
+
+        self.qk_norm = str(qk_norm).lower()
+        self.qk_norm_eps = float(qk_norm_eps)
 
         rotary_dim = int(self.head_dim * rotary_pct)
         rotary_dim = rotary_dim - (rotary_dim % 2)
@@ -607,6 +632,24 @@ class CrossAttentionRoPE(nn.Module):
             q = torch.cat([q_rot, q_pass], dim=-1)
             k = torch.cat([k_rot, k_pass], dim=-1)
 
+        # Optional QK normalization (attention stability)
+        if self.qk_norm != "off":
+            eps = self.qk_norm_eps
+            if self.qk_norm == "l2":
+                q = q / (q.norm(dim=-1, keepdim=True) + eps)
+                k = k / (k.norm(dim=-1, keepdim=True) + eps)
+                scale = math.sqrt(self.head_dim)
+                q = q * scale
+                k = k * scale
+            elif self.qk_norm in ("rms", "rmsnorm"):
+                q = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + eps)
+                k = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + eps)
+            elif self.qk_norm in ("layernorm", "ln"):
+                q = F.layer_norm(q, (self.head_dim,), eps=eps)
+                k = F.layer_norm(k, (self.head_dim,), eps=eps)
+            else:
+                raise ValueError(f"Unknown attn_qk_norm: {self.qk_norm}")
+            
         attn_mask = None
         if kv_padding_mask is not None:
             attn_mask = (~kv_padding_mask)[:, None, None, :]  # (B,1,1,Lk)
@@ -716,6 +759,8 @@ class TransformerBlock(nn.Module):
             attn_dropout=cfg.attn_dropout,
             rope_theta=cfg.rope_theta,
             rotary_pct=cfg.rotary_pct,
+            qk_norm=getattr(cfg, "attn_qk_norm", "off"),
+            qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
         )
         self.norm2 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
         self.mlp = make_mlp(cfg.mlp_type, cfg.d_model, cfg.mlp_ratio, cfg.dropout)
@@ -760,6 +805,8 @@ class FullAttentionBlock(nn.Module):
             attn_dropout=cfg.attn_dropout,
             rope_theta=cfg.rope_theta,
             rotary_pct=cfg.rotary_pct,
+            qk_norm=getattr(cfg, "attn_qk_norm", "off"),
+            qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
         )
 
         self.norm2 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
@@ -828,6 +875,8 @@ class DividedSpatiotemporalBlock(nn.Module):
             attn_dropout=cfg.attn_dropout,
             rope_theta=cfg.rope_theta,
             rotary_pct=cfg.rotary_pct,
+            qk_norm=getattr(cfg, "attn_qk_norm", "off"),
+            qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
         )
 
         # spatial pass
@@ -838,6 +887,8 @@ class DividedSpatiotemporalBlock(nn.Module):
             attn_dropout=cfg.attn_dropout,
             rope_theta=cfg.rope_theta,
             rotary_pct=0.0,  # no RoPE in spatial pass
+            qk_norm=getattr(cfg, "attn_qk_norm", "off"),
+            qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
         )
 
         # MLP
