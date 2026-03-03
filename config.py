@@ -73,7 +73,7 @@ class EEGModelConfig:
     isFourier: bool = False
 
     # --------- Frequency features ----------
-    freq_min_hz: float = 0.5
+    freq_min_hz: float = 1.0
     freq_max_hz: float = 45.0
     freq_bins: int = 32
     freq_spacing: str = "log"          # "log" or "linear"
@@ -134,39 +134,14 @@ class TrainConfig:
     post_split_shuffle: int = 128
     eviction_interval: int = 8
 
-    # ------------------------------------------------------------
     # Long-segment (60s) handling
-    # ------------------------------------------------------------
-    base_seconds: int = 10
-
-    # legacy split-long (oversampling risk; kept for backward compatibility)
-    split_long_prob: float = 0.0
-
-    # legacy random window crop (deprecated): only when long_multicrop_mode=="off"
-    long_crop_prob: float = 0.0
+    long_crop_prob: float = 0.2
     long_crop_30_prob: float = 0.5
-
-    # DINO-style multi-crop for 60s
-    long_multicrop_mode: str = "expand"     # "off" | "expand" | "multiview"
-    long_multicrop_prob: float = 0.3
-    long_multicrop_n_global: int = 1
-    long_multicrop_global_sec: int = 30
-    long_multicrop_n_local: int = 4
-    long_multicrop_local_sec: int = 10
-    long_multicrop_local_within_global: bool = True
-
-    # multi-view training (only when long_multicrop_mode == "multiview")
-    multiview_loss_weight: float = 0.05
-    multiview_only_for_multicrop: bool = True
-
     enable_channel_grouping: bool = True
 
     # bucket batching
     tokens_per_batch: int = 16384
     max_samples_per_batch: int = 256
-
-    # (optional; for AdaptiveTokenBucketBatcher experiments)
-    bucket_boundaries: str = "" #"0,200,400,800,1200,2000,4096"
 
     # auto-tune tokens_per_batch with a synthetic probe (optional)
     auto_tune_tokens_per_batch: bool = False
@@ -210,7 +185,7 @@ class TrainConfig:
 
     # token-budget accumulation (dynamic)
     accum_tokens_basis: str = "target"  # "target" | "context" | "valid" | "micro"(internal)
-    tokens_per_update: int = 8192
+    tokens_per_update: int = 131_072
 
     max_steps: int = 200_000
     warmup_steps: int = 5_000
@@ -218,7 +193,7 @@ class TrainConfig:
     # --------- LR schedule ----------
     # Baseline: cosine warmup over steps (existing behavior)
     # Optional: token-based WCC (warmup-constant-cooldown trapezoid) over *effective tokens*.
-    lr_schedule: str = "cosine"  # cosine | token_wcc
+    lr_schedule: str = "token_wcc"  # cosine | token_wcc
     min_lr: float = 0.0
 
     # Token-based WCC params (only used when lr_schedule=="token_wcc")

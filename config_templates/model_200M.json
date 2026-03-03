@@ -29,7 +29,7 @@
   "coord_jitter_std": 0.05,
   "coord_jitter_prob": 0.5,
   "coord_renormalize": false,
-  "freq_min_hz": 0.5,
+  "freq_min_hz": 1.0,
   "freq_max_hz": 45.0,
   "freq_bins": 32,
   "freq_spacing": "log",

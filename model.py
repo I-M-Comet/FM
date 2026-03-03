@@ -972,10 +972,10 @@ class DividedSpatiotemporalBlock(nn.Module):
             pad_sel = pad_t[nonempty]
             rope = torch.arange(P, device=x.device, dtype=torch.long)
             y_sel = self.attn_t(x_sel, padding_mask=pad_sel, rope_pos=rope, attn_bias=None)
-            y_t = x_t.new_zeros(x_t.shape)
+            y_t = x_t.new_zeros(x_t.shape, dtype=y_sel.dtype)
             y_t[nonempty] = y_sel
         else:
-            y_t = x_t.new_zeros(x_t.shape)
+            y_t = x_t.new_zeros(x_t.shape, dtype=x_t.dtype)
 
         grid_out = y_t.reshape(grid.shape)
         return self._gather_from_grid(grid_out, pad, c_idx, t_idx)
@@ -1011,10 +1011,10 @@ class DividedSpatiotemporalBlock(nn.Module):
                 b_idx = group_idx // P
                 bias_sel = spatial_bias_cc.to(dtype=x.dtype, device=x.device)[b_idx]  # (n_sel,C,C)
             y_sel = self.attn_s(x_sel, padding_mask=pad_sel, rope_pos=None, attn_bias=bias_sel)
-            y_s = x_s.new_zeros(x_s.shape)
+            y_s = x_s.new_zeros(x_s.shape, dtype=y_sel.dtype)
             y_s[nonempty] = y_sel
         else:
-            y_s = x_s.new_zeros(x_s.shape)
+            y_s = x_s.new_zeros(x_s.shape, dtype=x_s.dtype)
 
         grid_tp_out = y_s.reshape(grid_tp.shape)  # (B,P,C,D)
         grid_out = grid_tp_out.permute(0, 2, 1, 3).contiguous()  # (B,C,P,D)

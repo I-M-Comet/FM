@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import csv
 import math
 import os
 import re
@@ -34,6 +35,47 @@ try:
     from accelerate.utils import set_seed
 except Exception:
     Accelerator = None
+
+
+class MetricsWriter:
+    """Write training metrics to disk when W&B is disabled.
+
+    - metrics.jsonl: full logs as JSON lines (lossless)
+    - metrics.csv: first-seen keys only (stable, lightweight)
+    """
+
+    def __init__(self, out_dir: str):
+        os.makedirs(out_dir, exist_ok=True)
+        self.jsonl_path = os.path.join(out_dir, "metrics.jsonl")
+        self.csv_path = os.path.join(out_dir, "metrics.csv")
+        self._jsonl_f = open(self.jsonl_path, "a", encoding="utf-8")
+        self._csv_f = open(self.csv_path, "a", encoding="utf-8", newline="")
+        self._csv_writer = None
+        self._csv_fieldnames = None
+
+    def write(self, step: int, logs: dict):
+        row = dict(logs)
+        row["step"] = int(step)
+        row["wall_time"] = float(time.time())
+
+        self._jsonl_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._jsonl_f.flush()
+
+        if self._csv_writer is None:
+            self._csv_fieldnames = sorted(row.keys())
+            self._csv_writer = csv.DictWriter(self._csv_f, fieldnames=self._csv_fieldnames)
+            if self._csv_f.tell() == 0:
+                self._csv_writer.writeheader()
+
+        csv_row = {k: row.get(k, "") for k in self._csv_fieldnames}
+        self._csv_writer.writerow(csv_row)
+        self._csv_f.flush()
+
+    def close(self):
+        try:
+            self._jsonl_f.close()
+        finally:
+            self._csv_f.close()
 
 
 def set_torch_flags_for_sdp():
@@ -535,6 +577,8 @@ def main():
             config={**model_cfg.to_dict(), **train_cfg.to_dict()},
             init_kwargs={"wandb": {"name": train_cfg.run_name}} if train_cfg.run_name else None,
         )
+    else:
+        metrics_writer = MetricsWriter(train_cfg.output_dir)
 
     set_torch_flags_for_sdp()
 
@@ -605,18 +649,7 @@ def main():
         cache_dir=train_cfg.cache_dir,
         shard_shuffle=train_cfg.shard_shuffle,
         sample_shuffle=train_cfg.sample_shuffle,
-        base_seconds=train_cfg.base_seconds,
-        split_long_prob=train_cfg.split_long_prob,
-        # NEW: DINO-style multi-crop for 60s segments
-        long_multicrop_mode=getattr(train_cfg, "long_multicrop_mode", "off"),
-        long_multicrop_prob=getattr(train_cfg, "long_multicrop_prob", 0.0),
-        long_multicrop_n_global=getattr(train_cfg, "long_multicrop_n_global", 1),
-        long_multicrop_global_sec=getattr(train_cfg, "long_multicrop_global_sec", 30),
-        long_multicrop_n_local=getattr(train_cfg, "long_multicrop_n_local", 0),
-        long_multicrop_local_sec=getattr(train_cfg, "long_multicrop_local_sec", 10),
-        long_multicrop_local_within_global=getattr(train_cfg, "long_multicrop_local_within_global", True),
-        # legacy random window crop (deprecated)
-        long_crop_prob=getattr(train_cfg, "long_crop_prob", 0.0),
+        long_crop_prob=getattr(train_cfg, "long_crop_prob", 0.2),
         long_crop_30_prob=getattr(train_cfg, "long_crop_30_prob", 0.5),
         max_tokens=model_cfg.max_tokens,
         patch_samples=patch_samples,
@@ -645,17 +678,6 @@ def main():
         shuffle_within_bucket=True,
         yield_incomplete=True,
     )
-    # bucket_bounds = train_cfg.bucket_bounds()
-    # ds_batched = AdaptiveTokenBucketBatcher(
-    #     dataset=ds,
-    #     boundaries=bucket_bounds,
-    #     tokens_per_batch=train_cfg.tokens_per_batch,
-    #     max_samples_per_batch=train_cfg.max_samples_per_batch,
-    #     patch_samples=patch_samples,
-    #     hop_samples=hop_samples,
-    #     allow_token_overshoot_ratio=train_cfg.allow_token_overshoot_ratio,
-    #     padded_tokens_per_batch=train_cfg.padded_tokens_per_batch,
-    # )
 
     import webdataset as wds
     loader = wds.WebLoader(ds_batched, batch_size=None, num_workers=train_cfg.num_workers)
@@ -765,7 +787,7 @@ def main():
             it = iter(loader)
             batch = next(it)
 
-        x = batch["eeg"]          # (B,C,T)
+        x = batch["eeg"].to(dev)          # (B,C,T)
         coords = batch["coord"]   # (B,C,3)
         metas = batch.get("meta", None)  # optional list[dict]
         x = rescale_small_segments(x, target_rms=1.0, rms_low=0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
@@ -1238,17 +1260,22 @@ def main():
                         "multiview/loss_mean": mv_mean,
                         "multiview/weight": float(mv_weight),
                     })
+                if metrics_writer is not None:
+                    metrics_writer.write(global_step, logs)
                 accelerator.log(logs, step=global_step)
                 start_time = time.time()
 
-            if accelerator.is_main_process and (global_step % train_cfg.save_every == 0):
+            if (train_cfg.save_every > 0) and ((global_step + 1) % train_cfg.save_every == 0):
+            # if accelerator.is_main_process and (global_step % train_cfg.save_every == 0):
                 accelerator.wait_for_everyone()
                 ckpt_dir = os.path.join(train_cfg.output_dir, f"step_{global_step:07d}")
                 os.makedirs(ckpt_dir, exist_ok=True)
-                accelerator.unwrap_model(student).save_pretrained(os.path.join(ckpt_dir, f"student_{global_step:07d}"))
-                torch.save(accelerator.unwrap_model(predictor).state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step:07d}.pt"))
-                accelerator.unwrap_model(teacher).save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step:07d}"))
+                if accelerator.is_main_process:
+                    accelerator.unwrap_model(student).save_pretrained(os.path.join(ckpt_dir, f"student_{global_step:07d}"))
+                    torch.save(accelerator.unwrap_model(predictor).state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step:07d}.pt"))
+                    accelerator.unwrap_model(teacher).save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step:07d}"))
                 accelerator.save_state(os.path.join(ckpt_dir, f"accelerator_state_{global_step:07d}"))
+                accelerator.wait_for_everyone()
 
             # reset accumulation window
             accum_tokens = 0
@@ -1285,14 +1312,18 @@ def main():
 
     pbar.close()
 
+    accelerator.wait_for_everyone()  # ensure all processes have finished saving before we write the final checkpoint
+    final_dir = os.path.join(train_cfg.output_dir, "final")
     if accelerator.is_main_process:
-        accelerator.wait_for_everyone()  # ensure all processes have finished saving before we write the final checkpoint
-        final_dir = os.path.join(train_cfg.output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         accelerator.unwrap_model(student).save_pretrained(os.path.join(final_dir, "student"))
         torch.save(accelerator.unwrap_model(predictor).state_dict(), os.path.join(final_dir, "predictor.pt"))
         accelerator.unwrap_model(teacher).save_pretrained(os.path.join(final_dir, "teacher"))
-        accelerator.save_state(os.path.join(final_dir, "accelerator_state"))
+    accelerator.save_state(os.path.join(final_dir, "accelerator_state"))
+
+    # Close local metrics writer (if any)
+    if metrics_writer is not None and accelerator.is_main_process:
+        metrics_writer.close()
 
 if __name__ == "__main__":
     main()

@@ -22,7 +22,7 @@ except Exception:
 
 
 EEG_KEY = "eeg.npy"
-COORD_KEY = "coord.npy"
+COORD_KEY = "coords.npy"
 META_KEY = "meta.json"
 
 @contextmanager
@@ -121,7 +121,6 @@ def _flatmap_stage(mapper):
     return _iter
 
 
-
 def compute_num_patches(T: int, patch_samples: int, hop_samples: int) -> int:
     """Number of sliding-window patches.
     P = floor((T - patch)/hop) + 1. Requires T >= patch.
@@ -131,243 +130,58 @@ def compute_num_patches(T: int, patch_samples: int, hop_samples: int) -> int:
     return int((T - patch_samples) // hop_samples + 1)
 
 
-def maybe_split_long_to_base(
-    ex: Dict[str, Any],
-    base_seconds: int,
-    split_prob: float,
-) -> List[Dict[str, Any]]:
-    eeg: torch.Tensor = ex["eeg"]  # (C,T)
-    coord: torch.Tensor = ex["coord"]
-    meta: Dict[str, Any] = ex.get("meta", {})
-
-    fs = int(meta.get("fs", 200))
-    duration_sec = int(eeg.shape[-1] / fs)
-
-    # duration 정보가 없으면 split 안 함
-    if duration_sec not in (base_seconds, 10, 30, 60):
-        return [ex]
-
-    if duration_sec <= base_seconds:
-        return [ex]
-
-    if random.random() >= split_prob:
-        return [ex]
-
-    chunk_samples = base_seconds * fs
-    C, T = eeg.shape
-    n_chunks = duration_sec // base_seconds
-    outs = []
-    for i in range(n_chunks):
-        s = i * chunk_samples
-        e = (i + 1) * chunk_samples
-        if e > T:
-            break
-        out = {
-            "eeg": eeg[:, s:e].contiguous(),
-            "coord": coord,
-            "meta": dict(meta),
-        }
-        out["meta"]["duration_sec"] = base_seconds
-        out["meta"]["chunk_index"] = i
-        out["meta"]["parent_duration_sec"] = duration_sec
-        outs.append(out)
-    return outs if len(outs) > 0 else [ex]
-
-
 def maybe_random_window_crop_60s(
     ex: Dict[str, Any],
     crop_prob: float,
     crop_30_prob: float,
+    align_to_seconds: bool = True,   # 추가: 1초 경계로 자를지
 ) -> Dict[str, Any]:
-    """
-    NEW: 60초 샘플에 대해서만 확률적으로 random window crop(10s or 30s).
-    - oversampling을 만들기 쉬운 split(10s*6) 대신,
-      epoch/step가 진행되면서 서로 다른 윈도우가 샘플링되도록 하는 방식.
-
-    Args:
-      crop_prob: P(crop | duration==60)
-      crop_30_prob: P(choose 30s | crop triggered)
-    """
     if crop_prob <= 0:
         return ex
 
     eeg: torch.Tensor = ex["eeg"]
-    coord: torch.Tensor = ex["coord"]
     meta: Dict[str, Any] = ex.get("meta", {})
 
-    fs = int(meta.get("fs", 200))
-    if fs <= 0:
-        fs = 200
-    duration_sec = int(round(eeg.shape[-1] / fs))
+    fs = int(meta.get("fs", 200)) or 200
+    duration_sec = int(eeg.shape[-1] // fs)
 
     if duration_sec != 60:
         return ex
     if random.random() >= float(crop_prob):
         return ex
 
-    # choose crop length
     crop_sec = 30 if (random.random() < float(crop_30_prob)) else 10
     crop_samples = int(crop_sec * fs)
     C, T = eeg.shape
-    if T <= crop_samples:
+    if T < crop_samples:
         return ex
 
-    start = random.randint(0, T - crop_samples)
+    if align_to_seconds:
+        start_sec = random.randint(0, 60 - crop_sec)
+        start = start_sec * fs
+    else:
+        start = random.randint(0, T - crop_samples)
+        start_sec = start / fs
+
     eeg2 = eeg[:, start : start + crop_samples].contiguous()
 
-    out = {
-        "eeg": eeg2,
-        "coord": coord,
-        "meta": dict(meta),
-    }
-    out["meta"]["duration_sec"] = int(crop_sec)
-    out["meta"]["parent_duration_sec"] = int(duration_sec)
-    out["meta"]["crop_start"] = int(start)
-    out["meta"]["cropped_from_long_window"] = True
+    # ✅ 기존 필드 유지
+    out = dict(ex)
+    out["eeg"] = eeg2
+
+    meta2 = dict(meta)
+    meta2["duration_sec"] = int(crop_sec)
+    meta2["parent_duration_sec"] = int(duration_sec)
+    meta2["crop_start"] = int(start)
+    meta2["crop_start_sec"] = float(start_sec)
+    meta2["cropped_from_long_window"] = True
+    out["meta"] = meta2
+
+    # (선택) key를 바꿔서 디버깅/분석에 도움
+    # if "__key__" in out and isinstance(out["__key__"], str):
+    #     out["__key__"] = f"{out['__key__']}_t{int(start_sec):02d}_d{crop_sec:02d}"
+
     return out
-
-
-def _make_parent_uid(meta: Dict[str, Any]) -> str:
-    """Best-effort unique id for a recording sample.
-
-    We prefer webdataset identifiers (__url__, __key__). If unavailable, we fall back to
-    a hash of (dataset, subject, session, etc.) when present.
-    """
-    url = str(meta.get("__url__", ""))
-    key = str(meta.get("__key__", ""))
-    if url or key:
-        return f"{url}::{key}"
-
-    # fallback: hash a subset of metadata
-    fields = [
-        str(meta.get("dataset", "")),
-        str(meta.get("subject", meta.get("subj", ""))),
-        str(meta.get("session", "")),
-        str(meta.get("run", "")),
-        str(meta.get("recording_id", meta.get("id", ""))),
-    ]
-    s = "|".join(fields)
-    if s.strip("|"):
-        h = hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
-        return f"meta::{h}"
-    # last resort: random uid (won't pair reliably, but avoids crashes)
-    return f"rand::{random.getrandbits(64):016x}"
-
-
-def maybe_dino_multicrop_60s(
-    ex: Dict[str, Any],
-    mode: str,
-    local_prob: float,
-    n_global: int,
-    global_sec: int,
-    n_local: int,
-    local_sec: int,
-    local_within_global: bool = True,
-) -> List[Dict[str, Any]]:
-    """DINO-style multi-crop for 60s segments.
-
-    Output is a list of independent samples (for WebDataset flatmap).
-
-    Semantics:
-      - Always emits n_global "global" crops (default: 1x 30s).
-      - With prob=local_prob, additionally emits n_local "local" crops (default: 4x 10s).
-      - If local_within_global=True, local crops are sampled inside the FIRST global crop window
-        (better-aligned for multi-view consistency losses).
-
-    mode:
-      - "off"      : returns [ex]
-      - "expand"   : just returns crops (no training-side coupling)
-      - "multiview": returns crops with meta fields needed for pairing (train.py uses them)
-
-    NOTE:
-      - We only apply this when duration_sec == 60 (based on meta/fs or T/fs).
-      - If crop length exceeds signal length, we fall back to [ex].
-    """
-    mode = str(mode).lower().strip()
-    if mode in ("off", "none", "disabled", "disable"):
-        return [ex]
-
-    eeg: torch.Tensor = ex["eeg"]  # (C,T)
-    coord: torch.Tensor = ex["coord"]
-    meta: Dict[str, Any] = ex.get("meta", {})
-    if not isinstance(meta, dict):
-        meta = {"meta": meta}
-
-    fs = int(meta.get("fs", 200))
-    if fs <= 0:
-        fs = 200
-    duration_sec = int(round(eeg.shape[-1] / fs))
-    if duration_sec != 60:
-        return [ex]
-
-    C, T = eeg.shape
-    global_samples = int(global_sec * fs)
-    local_samples = int(local_sec * fs)
-
-    if global_samples <= 0 or local_samples <= 0:
-        return [ex]
-    if T < min(global_samples, local_samples):
-        return [ex]
-
-    parent_uid = str(meta.get("parent_uid", ""))
-    if not parent_uid:
-        parent_uid = _make_parent_uid(meta)
-
-    outs: List[Dict[str, Any]] = []
-
-    # ---- global crops ----
-    n_global = int(max(1, n_global))
-    g0_start = 0
-    for gi in range(n_global):
-        if T <= global_samples:
-            start = 0
-        else:
-            start = random.randint(0, T - global_samples)
-        if gi == 0:
-            g0_start = int(start)
-        eeg_g = eeg[:, start : start + global_samples].contiguous()
-        meta_g = dict(meta)
-        meta_g.update({
-            "parent_uid": parent_uid,
-            "multicrop": True,
-            "view_type": "global",
-            "view_id": int(gi),
-            "parent_duration_sec": 60,
-            "duration_sec": int(global_sec),
-            "crop_start": int(start),
-            "crop_len": int(global_samples),
-        })
-        outs.append({"eeg": eeg_g, "coord": coord, "meta": meta_g})
-
-    # ---- local crops (probabilistic) ----
-    if (n_local > 0) and (local_prob > 0) and (random.random() < float(local_prob)):
-        n_local = int(max(1, n_local))
-        for li in range(n_local):
-            if T <= local_samples:
-                start = 0
-            else:
-                if local_within_global and (global_samples >= local_samples) and (T >= global_samples):
-                    lo = g0_start
-                    hi = g0_start + (global_samples - local_samples)
-                    hi = max(lo, min(hi, T - local_samples))
-                    start = random.randint(int(lo), int(hi))
-                else:
-                    start = random.randint(0, T - local_samples)
-            eeg_l = eeg[:, start : start + local_samples].contiguous()
-            meta_l = dict(meta)
-            meta_l.update({
-                "parent_uid": parent_uid,
-                "multicrop": True,
-                "view_type": "local",
-                "view_id": int(li),
-                "parent_duration_sec": 60,
-                "duration_sec": int(local_sec),
-                "crop_start": int(start),
-                "crop_len": int(local_samples),
-            })
-            outs.append({"eeg": eeg_l, "coord": coord, "meta": meta_l})
-
-    return outs if len(outs) > 0 else [ex]
 
 
 def maybe_group_channels(
@@ -459,39 +273,6 @@ def maybe_group_channels(
     ex["n_channels"] = int(C)
     return ex
 
-
-
-def collate_pad(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: int) -> Dict[str, Any]:
-    B = len(batch)
-    n_channels = torch.tensor([b["n_channels"] for b in batch], dtype=torch.long)
-    n_patches = torch.tensor([b["n_patches"] for b in batch], dtype=torch.long)
-
-    C_max = int(n_channels.max().item())
-    P_max = int(n_patches.max().item())
-    T_max = (P_max - 1) * hop_samples + patch_samples if P_max > 0 else 0
-
-    eeg_pad = torch.zeros((B, C_max, T_max), dtype=torch.float16)
-    coord_pad = torch.zeros((B, C_max, 3), dtype=torch.float32)
-
-    for i, b in enumerate(batch):
-        eeg = b["eeg"]    # (C,T)
-        coord = b["coord"]
-        C, T = eeg.shape
-        P = compute_num_patches(T, patch_samples=patch_samples, hop_samples=hop_samples)
-        T_need = (P - 1) * hop_samples + patch_samples if P > 0 else 0
-        eeg = eeg[:, :T_need]
-        eeg_pad[i, :C, :T_need] = eeg
-        coord_pad[i, :C, :] = coord
-
-    meta = [b.get("meta", {}) for b in batch]
-
-    return {
-        "eeg": eeg_pad,
-        "coord": coord_pad,
-        "n_channels": n_channels,
-        "n_patches": n_patches,
-        "meta": meta,
-    }
 
 def collate_stack(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: int) -> Dict[str, Any]:
     """
@@ -810,125 +591,12 @@ class ShapeBatcher(IterableDataset):
                 for out in _flush_key(k):
                     yield out
 
-class AdaptiveTokenBucketBatcher(IterableDataset):
-    """
-    NEW(C): token-length bucket batching + greedy packing
-    - bucket 내에서 sum(valid_tokens)가 tokens_per_batch를 크게 초과하지 않게
-      '추가하면 너무 초과되는 샘플'은 다음 배치로 넘김.
-    - optional로 padded budget (batch_size * max_len)도 제한 가능.
-
-    목적:
-    - padding 최소화(버킷)
-    - step당 compute 변동 감소(그리디/예산)
-    """
-    def __init__(
-        self,
-        dataset: Iterable[Dict[str, Any]],
-        boundaries: List[int],
-        tokens_per_batch: int,
-        max_samples_per_batch: int,
-        patch_samples: int,
-        hop_samples: int,
-        allow_token_overshoot_ratio: float = 1.10,
-        padded_tokens_per_batch: int = 0,
-    ):
-        self.dataset = dataset
-        self.boundaries = boundaries
-        self.tokens_per_batch = int(tokens_per_batch)
-        self.max_samples_per_batch = int(max_samples_per_batch)
-        self.hop_samples = int(hop_samples)
-        self.patch_samples = int(patch_samples)
-        self.allow_token_overshoot_ratio = float(allow_token_overshoot_ratio)
-        self.padded_tokens_per_batch = int(padded_tokens_per_batch)
-
-        assert len(boundaries) >= 2
-        assert self.tokens_per_batch > 0
-
-    def _bucket_id(self, n_tokens: int) -> int:
-        for i in range(len(self.boundaries) - 1):
-            if self.boundaries[i] <= n_tokens < self.boundaries[i + 1]:
-                return i
-        return len(self.boundaries) - 2
-
-    def __iter__(self) -> Iterator[Dict[str, Any]]:
-        nb = len(self.boundaries) - 1
-        buckets: List[List[Dict[str, Any]]] = [[] for _ in range(nb)]
-        sums = [0 for _ in range(nb)]
-        maxlens = [0 for _ in range(nb)]  # max n_tokens in bucket
-
-        for ex in self.dataset:
-            n = int(ex.get("n_tokens", 0))
-            if n <= 0:
-                continue
-
-            b = self._bucket_id(n)
-            cur = buckets[b]
-            cur_sum = sums[b]
-            cur_max = maxlens[b]
-
-            # NEW(C): if adding this sample would overshoot too much, flush current bucket first
-            if len(cur) > 0:
-                new_sum = cur_sum + n
-                over_limit = new_sum > int(self.tokens_per_batch * self.allow_token_overshoot_ratio)
-
-                # optional padded budget: (batch_size+1) * max(maxlen, n)
-                if self.padded_tokens_per_batch > 0:
-                    new_max = max(cur_max, n)
-                    padded_est = (len(cur) + 1) * new_max
-                    over_limit = over_limit or (padded_est > self.padded_tokens_per_batch)
-
-                if over_limit:
-                    batch = cur
-                    buckets[b] = []
-                    sums[b] = 0
-                    maxlens[b] = 0
-                    yield collate_pad(batch, patch_samples=self.patch_samples, hop_samples=self.hop_samples)
-
-                    # reset after flush
-                    cur = buckets[b]
-                    cur_sum = sums[b]
-                    cur_max = maxlens[b]
-
-            # add sample
-            cur.append(ex)
-            sums[b] = cur_sum + n
-            maxlens[b] = max(cur_max, n)
-
-            # flush if reached budget or too many samples
-            flush = False
-            if sums[b] >= self.tokens_per_batch:
-                flush = True
-            if len(cur) >= self.max_samples_per_batch:
-                flush = True
-            if self.padded_tokens_per_batch > 0:
-                padded_est = len(cur) * maxlens[b]
-                if padded_est >= self.padded_tokens_per_batch:
-                    flush = True
-
-            if flush:
-                batch = buckets[b]
-                buckets[b] = []
-                sums[b] = 0
-                maxlens[b] = 0
-                yield collate_pad(batch, patch_samples=self.patch_samples, hop_samples=self.hop_samples)
-
 
 def build_webdataset(
     shards: List[str],
     cache_dir: Optional[str],
     shard_shuffle: int,
     sample_shuffle: int,
-    base_seconds: int,
-    split_long_prob: float,
-    # NEW: DINO-style multi-crop on 60s segments
-    long_multicrop_mode: str,
-    long_multicrop_prob: float,
-    long_multicrop_n_global: int,
-    long_multicrop_global_sec: int,
-    long_multicrop_n_local: int,
-    long_multicrop_local_sec: int,
-    long_multicrop_local_within_global: bool,
-    # legacy: 60s random window crop (deprecated)
     long_crop_prob: float,
     long_crop_30_prob: float,
     max_tokens: int,
@@ -988,40 +656,8 @@ def build_webdataset(
         wds.decode(),
         wds.map(decode_sample),  # 여기서 torch로 변환
     ]
-
-    # ---------------------------------
-    # Long(60s) handling
-    # ---------------------------------
-    # Preferred: DINO-style multi-crop (global + local windows)
-    mc_mode = str(long_multicrop_mode).lower().strip()
-    if mc_mode not in ("off", "none", "disabled", "disable"):
-        pipeline.append(
-            _flatmap_stage(
-                lambda ex: maybe_dino_multicrop_60s(
-                    ex,
-                    mode=mc_mode,
-                    local_prob=long_multicrop_prob,
-                    n_global=long_multicrop_n_global,
-                    global_sec=long_multicrop_global_sec,
-                    n_local=long_multicrop_n_local,
-                    local_sec=long_multicrop_local_sec,
-                    local_within_global=long_multicrop_local_within_global,
-                )
-            )
-        )
-    else:
-        # Legacy: 60s only -> random window crop (10/30s)
-        if long_crop_prob and long_crop_prob > 0:
-            pipeline.append(
-                wds.map(lambda ex: maybe_random_window_crop_60s(ex, crop_prob=long_crop_prob, crop_30_prob=long_crop_30_prob))
-            )
-
-    # legacy option: split long -> base seconds (oversampling 주의)
-    # NOTE: multi-crop을 켠 경우에는 split을 함께 쓰지 않는 것을 권장.
-    if mc_mode in ("off", "none", "disabled", "disable"):
-        if split_long_prob and split_long_prob > 0:
-            pipeline.append(_flatmap_stage(lambda ex: maybe_split_long_to_base(ex, base_seconds=base_seconds, split_prob=split_long_prob)))
-
+    if long_crop_prob and long_crop_prob > 0:
+        pipeline.append(wds.map(lambda ex: maybe_random_window_crop_60s(ex, crop_prob=long_crop_prob, crop_30_prob=long_crop_30_prob)))
     # small shuffle after crop/split
     pipeline += [
         wds.shuffle(post_split_shuffle),
