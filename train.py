@@ -570,7 +570,8 @@ def main():
         os.makedirs(train_cfg.output_dir, exist_ok=True)
         model_cfg.save_json(os.path.join(train_cfg.output_dir, "model_config.json"))
         train_cfg.save_json(os.path.join(train_cfg.output_dir, "train_config.json"))
-
+        
+    metrics_writer = None
     if train_cfg.use_wandb:
         accelerator.init_trackers(
             train_cfg.wandb_project,

@@ -169,7 +169,7 @@ class TrainConfig:
     aug_channel_drop_prob: float = 0.05
 
     # --------- Freq corruption (student only) ----------
-    freq_domain_drop_prob: float = 0.5
+    freq_domain_drop_prob: float = 0.25
     freq_physio_mask_prob: float = 0.6
     freq_num_bands_min: int = 1
     freq_num_bands_max: int = 2
