@@ -359,6 +359,8 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=None)
     p.add_argument("--warmup_steps", type=int, default=None)
 
+    p.add_argument("--ema_momentum", type=float, default=None)
+
     # model-side ablations
     p.add_argument("--mlp_type", type=str, default=None)
     p.add_argument("--norm_type", type=str, default=None)
@@ -367,6 +369,7 @@ def parse_args():
     p.add_argument("--spatial_bias_degree", type=int, default=None)
 
     # masking ablations
+    p.add_argument("--is_SSP", type=bool, default=None)
     p.add_argument("--time_mask_ratio_min", type=float, default=None)
     p.add_argument("--time_mask_ratio_max", type=float, default=None)
     p.add_argument("--spatial_mask_ratio_min", type=float, default=None)
@@ -532,6 +535,9 @@ def main():
     if args.max_steps is not None: train_cfg.max_steps = args.max_steps
     if args.warmup_steps is not None: train_cfg.warmup_steps = int(args.warmup_steps)
 
+    if args.ema_momentum is not None: train_cfg.ema_momentum = float(args.ema_momentum)
+
+    if args.is_SSP is not None: train_cfg.is_SSP = bool(args.is_SSP)
     if args.time_mask_ratio_min is not None: train_cfg.time_mask_ratio_min = float(args.time_mask_ratio_min)
     if args.time_mask_ratio_max is not None: train_cfg.time_mask_ratio_max = float(args.time_mask_ratio_max)
     if args.spatial_mask_ratio_min is not None: train_cfg.spatial_mask_ratio_min = float(args.spatial_mask_ratio_min)
@@ -570,7 +576,7 @@ def main():
         os.makedirs(train_cfg.output_dir, exist_ok=True)
         model_cfg.save_json(os.path.join(train_cfg.output_dir, "model_config.json"))
         train_cfg.save_json(os.path.join(train_cfg.output_dir, "train_config.json"))
-        
+
     metrics_writer = None
     if train_cfg.use_wandb:
         accelerator.init_trackers(
@@ -820,6 +826,7 @@ def main():
             mask_spatial_prob=train_cfg.mask_spatial_prob,
             time_ratio_range=(train_cfg.time_mask_ratio_min, train_cfg.time_mask_ratio_max),
             spatial_ratio_range=(train_cfg.spatial_mask_ratio_min, train_cfg.spatial_mask_ratio_max),
+            is_SSP=train_cfg.is_SSP,
         )
         # optional dilation to reduce overlap leakage
         if train_cfg.mask_dilate_time and train_cfg.mask_dilate_time > 0:
@@ -1213,7 +1220,7 @@ def main():
                     "bucket_P": bucket_P,
                     "bucket_tok_per_sample": bucket_tok_per_sample,
                     "tokens_per_batch_cfg": int(train_cfg.tokens_per_batch),
-                    "steps_time": int(time.time() - start_time),
+                    "steps_time": float((time.time() - start_time) / train_cfg.log_every),
                 }
 
                 # cheap proxy metrics (representation health checks)
@@ -1242,7 +1249,7 @@ def main():
                 if manual_accum:
                     logs.update({
                         "accum_tokens": int(accum_tokens),
-                        "accum_tokens_overshoot": int(max(0, int(accum_tokens) - int(budget_tokens))),
+                        "accum_tokens_overshoot": float(max(0, int(accum_tokens) - int(budget_tokens)) / int(budget_tokens)),
                         "accum_micro": int(accum_micro),
                         "accum_unique_buckets": int(len(accum_bucket_keys)),
                         "accum_basis": accum_basis,

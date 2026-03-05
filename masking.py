@@ -19,14 +19,62 @@ def sample_time_block_mask(
     ratio_min: float,
     ratio_max: float,
     device: torch.device,
+    is_SSP: bool = False,
 ) -> torch.Tensor:
     mask = torch.zeros((B, C, P_t), dtype=torch.bool, device=device)
     for b in range(B):
-        frac = float(torch.empty((), device=device).uniform_(ratio_min, ratio_max).item())
-        L = max(1, int(round(frac * P_t)))
-        L = min(L, P_t)
-        s = _randint(0, P_t - L + 1, device=device)
-        mask[b, :, s : s + L] = True
+        if not is_SSP:
+            frac = float(torch.empty((), device=device).uniform_(ratio_min, ratio_max).item())
+            L = max(1, int(round(frac * P_t)))
+            L = min(L, P_t)
+            s = _randint(0, P_t - L + 1, device=device)
+            mask[b, :, s : s + L] = True
+        else:
+# ---------------- [신규] SSP (데이터 길이에 비례한 다중 서브시퀀스 보존) ----------------
+            # P_t(총 패치 수 = 총 초 수)를 sec_per_block으로 나누어 알맞은 블록 개수를 자동 계산합니다.
+            # 예: 10초 -> 1개, 30초 -> 3개, 60초 -> 6개
+            num_blocks = max(1, P_t // 10) # 10 sec
+            
+            num_masked = int(round(frac * P_t))
+            num_masked = min(max(0, num_masked), P_t)
+            num_kept = P_t - num_masked
+            
+            # 예외 처리: 전부 마스킹되거나, 하나도 마스킹 안 되는 경우
+            if num_kept <= 0:
+                mask[b, :, :] = True
+                continue
+            if num_masked <= 0:
+                continue
+            
+            # 보존할 블록 개수 조정 (보존할 패치 수보다 블록 수가 많을 순 없음)
+            actual_blocks = min(num_blocks, num_kept)
+            block_len = num_kept // actual_blocks
+            
+            # 베이스를 모두 마스킹(True)으로 덮음
+            mask[b, :, :] = True
+            
+            # 마스킹될 패치들을 보존할 블록 사이사이 간격에 무작위 분배
+            rand_spaces = torch.rand(actual_blocks + 1, device=device)
+            spaces = (rand_spaces / rand_spaces.sum() * num_masked).int()
+            
+            # 캐스팅 오차로 남는 자투리 패치는 랜덤한 공간에 1씩 추가 분배
+            remainder = num_masked - spaces.sum().item()
+            if remainder > 0:
+                indices = torch.randperm(actual_blocks + 1, device=device)[:remainder]
+                spaces[indices] += 1
+            
+            curr_idx = 0
+            for i in range(actual_blocks):
+                curr_idx += spaces[i].item()
+                
+                if i == actual_blocks - 1:
+                    curr_block_len = num_kept - (block_len * (actual_blocks - 1))
+                else:
+                    curr_block_len = block_len
+                    
+                # 보존할 영역 마스킹 해제 (False)
+                mask[b, :, curr_idx : curr_idx + curr_block_len] = False
+                curr_idx += curr_block_len
     return mask
 
 
@@ -72,6 +120,7 @@ def sample_jepa_target_mask(
     mask_spatial_prob: float,
     time_ratio_range: Tuple[float, float],
     spatial_ratio_range: Tuple[float, float],
+    is_SSP: bool = False,
 ) -> torch.Tensor:
     device = coords.device
     B, C_max, _ = coords.shape
@@ -96,6 +145,7 @@ def sample_jepa_target_mask(
             B=B, C=C_max, P_t=P_t_max,
             ratio_min=time_ratio_range[0], ratio_max=time_ratio_range[1],
             device=device,
+            is_SSP=is_SSP,
         )
         target = target | (tmask & use_time[:, None, None])
 

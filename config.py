@@ -155,6 +155,7 @@ class TrainConfig:
     mask_time_prob: float = 0.8
     mask_spatial_prob: float = 0.8
     mask_dilate_time: int = 0
+    is_SSP: bool = False 
     time_mask_ratio_min: float = 0.15
     time_mask_ratio_max: float = 0.35
     spatial_mask_ratio_min: float = 0.10
