@@ -155,11 +155,15 @@ class TrainConfig:
     mask_time_prob: float = 0.8
     mask_spatial_prob: float = 0.8
     mask_dilate_time: int = 0
-    is_SSP: bool = False 
     time_mask_ratio_min: float = 0.15
     time_mask_ratio_max: float = 0.35
     spatial_mask_ratio_min: float = 0.10
     spatial_mask_ratio_max: float = 0.30
+    time_mask_style: int = 0                 # 0: "single", 1: "multi", 2: "ssp"
+    time_mask_num_blocks: int = 4            # multi용 (I-JEPA는 M=4가 흔한 설정) :contentReference[oaicite:5]{index=5}
+    time_mask_min_block_patches: int = 2     # 너무 짧은 block 방지 (1초 패치면 2초)
+    time_ssp_keep_blocks: int = 3            # ssp용
+    time_ssp_min_keep_patches: int = 2
 
     # --------- Student augmentations (time-alignment preserving) ----------
     aug_gain_min: float = 0.8

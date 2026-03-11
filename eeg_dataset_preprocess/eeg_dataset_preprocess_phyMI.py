@@ -14,7 +14,7 @@ from tqdm import tqdm
 # ==============================================================================
 CONFIG = {
     "ROOT_DIR": "D:/open_eeg_eval/physionet_MI",           
-    "OUTPUT_DIR": "D:/open_eeg_eval/physionet_MI_pp/", 
+    "OUTPUT_DIR": "D:/open_eeg_eval/PhysioNetMI_npz/", 
     "montage": "standard_1005",
     "FILE_EXT": "*.edf", 
 
@@ -116,6 +116,22 @@ def clean_channel_names(raw):
     except: pass 
     return raw
 
+def get_valid_channel_indices(raw):
+    # 기존 원본 로직 유지
+    valid_names = []
+    valid_coords = []
+    
+    for ch_name in raw.ch_names:
+        if ch_name not in raw.info['chs'][raw.ch_names.index(ch_name)]['ch_name']: continue
+        ch_idx = raw.ch_names.index(ch_name)
+        loc = raw.info['chs'][ch_idx]['loc'][:3]
+        
+        if not np.all(np.isnan(loc)) and not np.all(loc == 0):
+            valid_names.append(ch_name)
+            valid_coords.append(loc)
+            
+    return valid_names, valid_coords
+
 # ==============================================================================
 # 2. Worker 함수 (Event 기반 Slicing)
 # ==============================================================================
@@ -133,12 +149,15 @@ def process_single_file(file_path):
 
         raw = clean_channel_names(raw)
         
-        missing_channels = [ch for ch in TARGET_CHANNELS if ch not in raw.ch_names]
-        if missing_channels: return None
+        # missing_channels = [ch for ch in TARGET_CHANNELS if ch not in raw.ch_names]
+        # if missing_channels: return None
         
-        raw.pick(TARGET_CHANNELS)
-        raw.reorder_channels(TARGET_CHANNELS)
-        
+        # raw.pick(TARGET_CHANNELS)
+        # raw.reorder_channels(TARGET_CHANNELS)
+        try:
+            montage = mne.channels.make_standard_montage(CONFIG["montage"])
+            raw.set_montage(montage, match_case=False, on_missing='ignore')
+        except: pass
         # [NEW] 어노테이션에서 이벤트 추출
         # events_from_annotations는 (이벤트배열, 이벤트ID딕셔너리)를 반환합니다.
         events, event_dict = mne.events_from_annotations(raw, verbose=False)
@@ -157,10 +176,14 @@ def process_single_file(file_path):
         total_length = processed_full.shape[-1]
         
         # 고정 좌표 추출
-        valid_coords = [raw.info['chs'][raw.ch_names.index(ch)]['loc'][:3] for ch in TARGET_CHANNELS]
+        valid_names, valid_coords = get_valid_channel_indices(raw)
+        # valid_coords = [raw.info['chs'][raw.ch_names.index(ch)]['loc'][:3] for ch in TARGET_CHANNELS]
         coords_array = np.array(valid_coords, dtype=np.float16)
         
         eeg_segments, coord_segments, labels = [], [], []
+        if processed_full.shape[-2] != len(coords_array): 
+            print(f"Channel count mismatch in {file_path}: data channels={processed_full.shape[-2]}, coords={len(coords_array)}")
+            return None
         
         # [NEW] 이벤트 발생 시점을 기준으로 데이터 Slicing
         for i in range(len(events)):

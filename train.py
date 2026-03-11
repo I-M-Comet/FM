@@ -12,7 +12,7 @@ import random
 import time
 from pathlib import Path
 from contextlib import ExitStack, nullcontext
-from typing import Tuple, Optional
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -211,7 +211,7 @@ def rescale_small_segments(
     rms_low: float = 0.5,
     rms_floor: float = 0.05,
     gain_max: float = 8.0,
-    clip: float = 10.0,
+    clip: float = 15.0,
 ) -> torch.Tensor:
     # fp32에서 통계 계산(안정)
     x32 = x.float()
@@ -336,8 +336,8 @@ def auto_tune_tokens_per_batch(
     return train_cfg.tokens_per_batch
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
+def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(add_help=add_help)
     p.add_argument("--model_cfg", type=str, default="")
     p.add_argument("--train_cfg", type=str, default="")
 
@@ -369,7 +369,7 @@ def parse_args():
     p.add_argument("--spatial_bias_degree", type=int, default=None)
 
     # masking ablations
-    p.add_argument("--is_SSP", type=bool, default=None)
+    p.add_argument("--time_mask_style", type=int, default=None)  # 0: "single", 1: "multi", 2: "ssp"
     p.add_argument("--time_mask_ratio_min", type=float, default=None)
     p.add_argument("--time_mask_ratio_max", type=float, default=None)
     p.add_argument("--spatial_mask_ratio_min", type=float, default=None)
@@ -383,6 +383,7 @@ def parse_args():
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--run_name", type=str, default=None)
+    p.add_argument("--wandb_project", type=str, default=None)
 
     # resume / init
     p.add_argument(
@@ -397,8 +398,26 @@ def parse_args():
         default=None,
         help="Initialize weights from a step_* checkpoint directory (student/teacher/predictor), but reset optimizer.",
     )
-    return p.parse_args()
+    return p
 
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def _build_train_artifacts(train_cfg: TrainConfig) -> Dict[str, object]:
+    final_dir = os.path.join(train_cfg.output_dir, "final")
+    return {
+        "output_dir": str(train_cfg.output_dir),
+        "final_dir": final_dir,
+        "student_dir": os.path.join(final_dir, "student"),
+        "teacher_dir": os.path.join(final_dir, "teacher"),
+        "predictor_path": os.path.join(final_dir, "predictor.pt"),
+        "run_name": getattr(train_cfg, "run_name", None),
+        "wandb_project": getattr(train_cfg, "wandb_project", None),
+        "seed": int(getattr(train_cfg, "seed", 42)),
+        "use_wandb": bool(getattr(train_cfg, "use_wandb", False)),
+    }
 
 def _resolve_accelerator_state_dir(p: Optional[str]) -> Optional[str]:
     if not p:
@@ -488,8 +507,7 @@ def _resolve_weights_in_step_dir(step_dir: str) -> Tuple[str, Optional[str], str
     return str(student_dirs[-1]), (str(teacher_dir) if teacher_dir else None), str(pred_pts[-1])
 
 
-def main():
-    args = parse_args()
+def run_train(args: argparse.Namespace) -> Dict[str, object]:
 
     if Accelerator is None:
         raise RuntimeError("accelerate is not installed. pip install accelerate")
@@ -537,7 +555,7 @@ def main():
 
     if args.ema_momentum is not None: train_cfg.ema_momentum = float(args.ema_momentum)
 
-    if args.is_SSP is not None: train_cfg.is_SSP = bool(args.is_SSP)
+    if args.time_mask_style is not None: train_cfg.time_mask_style = int(args.time_mask_style)
     if args.time_mask_ratio_min is not None: train_cfg.time_mask_ratio_min = float(args.time_mask_ratio_min)
     if args.time_mask_ratio_max is not None: train_cfg.time_mask_ratio_max = float(args.time_mask_ratio_max)
     if args.spatial_mask_ratio_min is not None: train_cfg.spatial_mask_ratio_min = float(args.spatial_mask_ratio_min)
@@ -546,6 +564,7 @@ def main():
     if args.use_wandb: train_cfg.use_wandb = True
     if args.no_wandb: train_cfg.use_wandb = False
     if args.run_name is not None: train_cfg.run_name = args.run_name
+    if args.wandb_project is not None: train_cfg.wandb_project = args.wandb_project
 
     # resume / init overrides
     if getattr(args, 'resume_from', None) is not None:
@@ -826,7 +845,11 @@ def main():
             mask_spatial_prob=train_cfg.mask_spatial_prob,
             time_ratio_range=(train_cfg.time_mask_ratio_min, train_cfg.time_mask_ratio_max),
             spatial_ratio_range=(train_cfg.spatial_mask_ratio_min, train_cfg.spatial_mask_ratio_max),
-            is_SSP=train_cfg.is_SSP,
+            time_mask_style=train_cfg.time_mask_style,
+            time_mask_num_blocks=train_cfg.time_mask_num_blocks,
+            time_mask_min_block_patches=train_cfg.time_mask_min_block_patches,
+            time_ssp_keep_blocks=train_cfg.time_ssp_keep_blocks,
+            time_ssp_min_keep_patches=train_cfg.time_ssp_min_keep_patches,
         )
         # optional dilation to reduce overlap leakage
         if train_cfg.mask_dilate_time and train_cfg.mask_dilate_time > 0:
@@ -1332,6 +1355,14 @@ def main():
     # Close local metrics writer (if any)
     if metrics_writer is not None and accelerator.is_main_process:
         metrics_writer.close()
+
+    accelerator.end_training()
+    return _build_train_artifacts(train_cfg)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> Dict[str, object]:
+    return run_train(parse_args(argv))
+
 
 if __name__ == "__main__":
     main()

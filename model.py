@@ -1258,7 +1258,7 @@ class EEGEncoder(nn.Module):
     def from_pretrained(path: str, map_location: str = "cpu") -> "EEGEncoder":
         cfg = EEGModelConfig.from_json(os.path.join(path, "config.json"))
         model = EEGEncoder(cfg)
-        sd = torch.load(os.path.join(path, "pytorch_model.bin"), map_location=map_location)
+        sd = torch.load(os.path.join(path, "pytorch_model.bin"), map_location=map_location, weights_only=True)
         model.load_state_dict(sd, strict=True)
         return model
 

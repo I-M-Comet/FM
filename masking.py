@@ -12,32 +12,158 @@ def _randint(low: int, high: int, device=None) -> int:
 
 
 @torch.no_grad()
-def sample_time_block_mask(
-    B: int,
+def _random_nonneg_composition(total: int, parts: int, device: torch.device) -> torch.Tensor:
+    """
+    Return nonnegative integer vector g of length=parts with sum(g)=total.
+    Simple multinomial-by-scatter (not uniform over compositions, but 충분히 랜덤).
+    """
+    g = torch.zeros((parts,), dtype=torch.long, device=device)
+    if total <= 0 or parts <= 0:
+        return g
+    idx = torch.randint(0, parts, (total,), device=device)
+    g.scatter_add_(0, idx, torch.ones((total,), dtype=torch.long, device=device))
+    return g
+
+
+@torch.no_grad()
+def _random_partition_with_min(total: int, parts: int, min_each: int, device: torch.device) -> torch.Tensor:
+    """
+    Return positive-ish partition of 'total' into 'parts' integers each >= min_each.
+    Caller must ensure total >= parts*min_each.
+    """
+    out = torch.full((parts,), int(min_each), dtype=torch.long, device=device)
+    rem = total - parts * min_each
+    if rem > 0:
+        idx = torch.randint(0, parts, (rem,), device=device)
+        out.scatter_add_(0, idx, torch.ones((rem,), dtype=torch.long, device=device))
+    return out
+
+
+@torch.no_grad()
+def sample_time_mask(
+    n_patches: torch.Tensor,      # (B,) 실제 P_t (각 샘플별)
     C: int,
-    P_t: int,
+    P_t_max: int,                 # batch 내 최대 P_t (텐서 shape 용)
     ratio_min: float,
     ratio_max: float,
     device: torch.device,
-    is_SSP: bool = False,
+    style: int = 0,               # 0: "single", 1: "multi", 2: "ssp"
+    num_blocks: int = 4,          # multi일 때 "masked blocks" 수
+    min_block_patches: int = 2,   # multi일 때 각 block 최소 길이(초 단위 패치면 2초)
+    ssp_keep_blocks: int = 3,     # ssp일 때 "keep blocks" 수
+    ssp_min_keep_patches: int = 2,# ssp keep 블록 최소 길이
+    short_P_threshold: int = 16,   # P_t가 이보다 작으면 multi에서 single로 폴백 (너무 짧은 시퀀스에서 multi가 trivial해지는 걸 방지)
 ) -> torch.Tensor:
-    mask = torch.zeros((B, C, P_t), dtype=torch.bool, device=device)
+    """
+    Returns mask (B,C,P_t_max), True=masked(target), False=visible(context candidate).
+
+    - single: 한 개 연속 time block을 마스크
+    - multi : 총 마스크 길이(frac*P)를 여러 개 block으로 쪼개서(서로 disjoint) 마스크
+    - ssp   : 전체를 마스크(True)로 두고, 여러 개 keep block만 False로 뚫음(=SSP)
+    """
+    B = int(n_patches.shape[0])
+
+    if style == 2:
+        mask = torch.ones((B, C, P_t_max), dtype=torch.bool, device=device)
+    else:
+        mask = torch.zeros((B, C, P_t_max), dtype=torch.bool, device=device)
+
     for b in range(B):
-        if not is_SSP:
-            frac = float(torch.empty((), device=device).uniform_(ratio_min, ratio_max).item())
-            L = max(1, int(round(frac * P_t)))
-            L = min(L, P_t)
-            s = _randint(0, P_t - L + 1, device=device)
+        P = int(n_patches[b].item())
+        if P <= 0:
+            continue
+
+        frac = float(torch.empty((), device=device).uniform_(ratio_min, ratio_max).item())
+
+        if style == 0:
+            L = max(1, int(round(frac * P)))
+            L = min(L, P)
+            s = _randint(0, P - L + 1, device=device)
             mask[b, :, s : s + L] = True
-        else:
-# ---------------- [신규] SSP (데이터 길이에 비례한 다중 서브시퀀스 보존) ----------------
-            # P_t(총 패치 수 = 총 초 수)를 sec_per_block으로 나누어 알맞은 블록 개수를 자동 계산합니다.
-            # 예: 10초 -> 1개, 30초 -> 3개, 60초 -> 6개
-            num_blocks = max(1, P_t // 10) # 10 sec
-            
-            num_masked = int(round(frac * P_t))
-            num_masked = min(max(0, num_masked), P_t)
-            num_kept = P_t - num_masked
+
+        elif style == 1:
+            if P <= short_P_threshold:
+                # fallback to single-block time mask
+                L = max(1, int(round(frac * P)))
+                if P > 1:
+                    L = min(L, P - 1)
+                L = min(L, P)
+                s = _randint(0, P - L + 1, device=device)
+                mask[b, :, s:s+L] = True
+                continue
+            # 총 masked 길이
+            L_total = max(1, int(round(frac * P)))
+            # context가 완전히 비면 학습이 깨질 수 있으니 1 patch는 남기기
+            if P > 1:
+                L_total = min(L_total, P - 1)
+            L_total = min(L_total, P)
+
+            # 너무 짧은 시퀀스에서 block이 쪼개져서 trivial해지는 걸 방지
+            min_len = int(min_block_patches)
+            min_len = max(1, min_len)
+            min_len = min(min_len, L_total)  # L_total보다 클 수 없음
+
+            # 가능한 block 수(각 block >= min_len)
+            max_blocks = max(1, L_total // min_len)
+            n = min(int(num_blocks), max_blocks)
+            n = max(1, min(n, L_total))
+
+            # L_total을 n개 block으로 partition (각 block >= min_len)
+            # total >= n*min_len은 위에서 n을 잡을 때 보장됨
+            lengths = _random_partition_with_min(L_total, n, min_len, device=device)  # (n,)
+
+            # gaps는 (n+1)개: gap + block + gap + block + ... + gap
+            gap_total = P - int(lengths.sum().item())  # = P - L_total
+            gaps = _random_nonneg_composition(gap_total, n + 1, device=device)
+
+            pos = int(gaps[0].item())
+            for i in range(n):
+                li = int(lengths[i].item())
+                if li > 0:
+                    mask[b, :, pos : pos + li] = True
+                pos = pos + li + int(gaps[i + 1].item())
+
+        elif style == 2:
+            # SSP: mask ratio=frac 만큼 마스크(True), keep blocks만 False로 뚫음
+            num_masked = int(round(frac * P))
+            num_masked = min(max(0, num_masked), P)
+            num_kept = P - num_masked
+
+            if num_kept <= 0:
+                # 전부 마스크(True) 상태 유지
+                continue
+            if num_masked <= 0:
+                # 전부 keep
+                mask[b, :, :P] = False
+                continue
+
+            min_keep = int(ssp_min_keep_patches)
+            min_keep = max(1, min_keep)
+            min_keep = min(min_keep, num_kept)  # num_kept보다 클 수 없음
+
+            # ✅ 핵심: min_keep를 만족할 수 있는 keep 블록 수로 제한
+            feasible_blocks = max(1, num_kept // min_keep)
+            n = min(int(ssp_keep_blocks), feasible_blocks)
+            n = max(1, min(n, num_kept))  # 안전장치
+            if P <= short_P_threshold:
+                n = 1
+
+            kept_lengths = _random_partition_with_min(num_kept, n, min_keep, device=device)  # (n,)
+            gaps = _random_nonneg_composition(num_masked, n + 1, device=device)              # (n+1,)
+
+            pos = int(gaps[0].item())
+            for i in range(n):
+                li = int(kept_lengths[i].item())
+                if li > 0:
+                    mask[b, :, pos : pos + li] = False
+                pos = pos + li + int(gaps[i + 1].item())
+        
+        elif style == 3:
+            #SSP origin?
+            num_blocks = max(1, P // 10) # 10 sec
+            num_masked = int(round(frac * P))
+            num_masked = min(max(0, num_masked), P)
+            num_kept = P - num_masked
             
             # 예외 처리: 전부 마스킹되거나, 하나도 마스킹 안 되는 경우
             if num_kept <= 0:
@@ -49,32 +175,21 @@ def sample_time_block_mask(
             # 보존할 블록 개수 조정 (보존할 패치 수보다 블록 수가 많을 순 없음)
             actual_blocks = min(num_blocks, num_kept)
             block_len = num_kept // actual_blocks
-            
-            # 베이스를 모두 마스킹(True)으로 덮음
+
+            kept_lengths = torch.full((actual_blocks,), block_len, dtype=torch.long, device=device)
+            kept_lengths[-1] += num_kept - (block_len * actual_blocks)  # 나머지 패치는 첫 번째 블록에 몰아서 추가
+            gaps = _random_nonneg_composition(num_masked, actual_blocks + 1, device=device) 
             mask[b, :, :] = True
-            
-            # 마스킹될 패치들을 보존할 블록 사이사이 간격에 무작위 분배
-            rand_spaces = torch.rand(actual_blocks + 1, device=device)
-            spaces = (rand_spaces / rand_spaces.sum() * num_masked).int()
-            
-            # 캐스팅 오차로 남는 자투리 패치는 랜덤한 공간에 1씩 추가 분배
-            remainder = num_masked - spaces.sum().item()
-            if remainder > 0:
-                indices = torch.randperm(actual_blocks + 1, device=device)[:remainder]
-                spaces[indices] += 1
-            
-            curr_idx = 0
+            pos = int(gaps[0].item())
             for i in range(actual_blocks):
-                curr_idx += spaces[i].item()
-                
-                if i == actual_blocks - 1:
-                    curr_block_len = num_kept - (block_len * (actual_blocks - 1))
-                else:
-                    curr_block_len = block_len
-                    
-                # 보존할 영역 마스킹 해제 (False)
-                mask[b, :, curr_idx : curr_idx + curr_block_len] = False
-                curr_idx += curr_block_len
+                li = int(kept_lengths[i].item())
+                if li > 0:
+                    mask[b, :, pos : pos + li] = False
+                pos = pos + li + int(gaps[i + 1].item())
+
+        else:
+            raise ValueError(f"unknown time mask style: {style}")
+
     return mask
 
 
@@ -120,7 +235,11 @@ def sample_jepa_target_mask(
     mask_spatial_prob: float,
     time_ratio_range: Tuple[float, float],
     spatial_ratio_range: Tuple[float, float],
-    is_SSP: bool = False,
+    time_mask_style: int = 0,     # 0: "single", 1: "multi", 2: "ssp"
+    time_mask_num_blocks: int = 4,       # multi일 때
+    time_mask_min_block_patches: int = 2,
+    time_ssp_keep_blocks: int = 3,       # ssp일 때
+    time_ssp_min_keep_patches: int = 2,
 ) -> torch.Tensor:
     device = coords.device
     B, C_max, _ = coords.shape
@@ -141,11 +260,18 @@ def sample_jepa_target_mask(
         use_time = use_time | none
 
     if use_time.any():
-        tmask = sample_time_block_mask(
-            B=B, C=C_max, P_t=P_t_max,
-            ratio_min=time_ratio_range[0], ratio_max=time_ratio_range[1],
+        tmask = sample_time_mask(
+            n_patches=n_patches,
+            C=C_max,
+            P_t_max=P_t_max,
+            ratio_min=time_ratio_range[0],
+            ratio_max=time_ratio_range[1],
             device=device,
-            is_SSP=is_SSP,
+            style=time_mask_style,
+            num_blocks=time_mask_num_blocks,
+            min_block_patches=time_mask_min_block_patches,
+            ssp_keep_blocks=time_ssp_keep_blocks,
+            ssp_min_keep_patches=time_ssp_min_keep_patches,
         )
         target = target | (tmask & use_time[:, None, None])
 
