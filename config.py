@@ -122,6 +122,7 @@ class TrainConfig:
     seed: int = 42
     torch_deterministic: bool = False
     cudnn_benchmark: bool = True
+    data_mode: str = "finite"   # "resampled" | "finite"
 
     # --------- Data ----------
     data_root: str = "/mnt/e/open_eeg"
@@ -171,7 +172,7 @@ class TrainConfig:
     aug_channel_gain_std: float = 0.0
     aug_noise_std_min: float = 0.00
     aug_noise_std_max: float = 0.03
-    aug_channel_drop_prob: float = 0.05
+    aug_channel_drop_prob: float = 0.00
 
     # --------- Freq corruption (student only) ----------
     freq_domain_drop_prob: float = 0.25

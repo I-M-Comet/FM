@@ -607,6 +607,8 @@ def build_webdataset(
     cache_max_bytes: int = 0, # ex: 500GB -> 500*1024**3
     post_split_shuffle: int = 256,
     eviction_interval: int = 8,
+    data_mode: str = "finite",
+    seed: int = 0,
 ) -> Iterable[Dict[str, Any]]:
     if wds is None:
         raise RuntimeError("webdataset is not installed. pip install webdataset")
@@ -633,17 +635,38 @@ def build_webdataset(
             ex["n_patches"] = int(P_t)
             ex["n_channels"] = int(C)
         return ex
-
+    if data_mode == "resampled":
     # ---- Recommended pipeline: shard-level shuffle -> split_by_node/worker -> (optional) cache -> tar -> sample shuffle(before decode) ----
-    src = wds.ResampledShards(shards)  # infinite pretrain
-    pipeline = [
-        src,
-        # shard-level shuffle (decode 이전, 가장 가벼움)
-        # webdataset에 detshuffle이 있으면 그걸 추천 (재현/분산에서 안정)
-        wds.shuffle(shard_shuffle),
-        wds.split_by_node,
-        wds.split_by_worker,
-    ]
+        src = wds.ResampledShards(shards)  # infinite pretrain
+        pipeline = [
+            src,
+            # shard-level shuffle (decode 이전, 가장 가벼움)
+            # webdataset에 detshuffle이 있으면 그걸 추천 (재현/분산에서 안정)
+            wds.shuffle(shard_shuffle),
+            wds.split_by_node,
+            wds.split_by_worker,
+        ]
+    elif data_mode == "finite":
+        # finite sweep 모드
+        src = wds.SimpleShardList(shards) if hasattr(wds, "SimpleShardList") else wds.shardlists.SimpleShardList(shards)
+        pipeline = [src]
+        if shard_shuffle > 0:
+            if hasattr(wds, "detshuffle"):
+                pipeline.append(
+                    wds.detshuffle(
+                        bufsize=shard_shuffle,
+                        initial=min(shard_shuffle, 32),
+                        seed=seed,
+                    )
+                )
+            else:
+                pipeline.append(wds.shuffle(shard_shuffle))
+        pipeline += [
+            wds.split_by_node,
+            wds.split_by_worker,
+        ]
+    else:
+        raise ValueError(f"Unsupported data_mode: {data_mode}")
 
     if cache is not None:
         # shard url(str) -> cached path(str)

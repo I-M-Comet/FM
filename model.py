@@ -408,6 +408,14 @@ class MultiheadSelfAttentionRoPE(nn.Module):
 
         self.qk_norm = str(qk_norm).lower()
         self.qk_norm_eps = float(qk_norm_eps)
+        if self.qk_norm != "off":
+            if self.qk_norm != "l2":
+                self.q_norm_weight = nn.Parameter(torch.ones(self.head_dim))
+                self.k_norm_weight = nn.Parameter(torch.ones(self.head_dim))
+            
+            if self.qk_norm in ("layernorm", "ln"):
+                self.q_norm_bias = nn.Parameter(torch.zeros(self.head_dim))
+                self.k_norm_bias = nn.Parameter(torch.zeros(self.head_dim))
 
         rotary_dim = int(self.head_dim * rotary_pct)
         rotary_dim = rotary_dim - (rotary_dim % 2)
@@ -501,18 +509,22 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         if self.qk_norm != "off":
             eps = self.qk_norm_eps
             if self.qk_norm == "l2":
-                q = q / (q.norm(dim=-1, keepdim=True) + eps)
-                k = k / (k.norm(dim=-1, keepdim=True) + eps)
+                q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
+                k_norm = k.to(torch.float32).norm(dim=-1, keepdim=True)
+                q = q / (q_norm.to(q.dtype) + eps)
+                k = k / (k_norm.to(k.dtype) + eps)
                 # compensate SDP's internal 1/sqrt(d) scaling (so logits stay O(1))
                 scale = math.sqrt(self.head_dim)
                 q = q * scale
                 k = k * scale
             elif self.qk_norm in ("rms", "rmsnorm"):
-                q = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + eps)
-                k = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + eps)
+                q_rms = q.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+                k_rms = k.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+                q = (q * torch.rsqrt(q_rms + eps).to(q.dtype)) * self.q_norm_weight
+                k = (k * torch.rsqrt(k_rms + eps).to(k.dtype)) * self.k_norm_weight
             elif self.qk_norm in ("layernorm", "ln"):
-                q = F.layer_norm(q, (self.head_dim,), eps=eps)
-                k = F.layer_norm(k, (self.head_dim,), eps=eps)
+                q = F.layer_norm(q, (self.head_dim,), weight=self.q_norm_weight, bias=self.q_norm_bias, eps=eps)
+                k = F.layer_norm(k, (self.head_dim,), weight=self.k_norm_weight, bias=self.k_norm_bias, eps=eps)
             else:
                 raise ValueError(f"Unknown attn_qk_norm: {self.qk_norm}")
             
@@ -559,6 +571,14 @@ class CrossAttentionRoPE(nn.Module):
 
         self.qk_norm = str(qk_norm).lower()
         self.qk_norm_eps = float(qk_norm_eps)
+        if self.qk_norm != "off":
+            if self.qk_norm != "l2":
+                self.q_norm_weight = nn.Parameter(torch.ones(self.head_dim))
+                self.k_norm_weight = nn.Parameter(torch.ones(self.head_dim))
+            
+            if self.qk_norm in ("layernorm", "ln"):
+                self.q_norm_bias = nn.Parameter(torch.zeros(self.head_dim))
+                self.k_norm_bias = nn.Parameter(torch.zeros(self.head_dim))
 
         rotary_dim = int(self.head_dim * rotary_pct)
         rotary_dim = rotary_dim - (rotary_dim % 2)
@@ -636,17 +656,22 @@ class CrossAttentionRoPE(nn.Module):
         if self.qk_norm != "off":
             eps = self.qk_norm_eps
             if self.qk_norm == "l2":
-                q = q / (q.norm(dim=-1, keepdim=True) + eps)
-                k = k / (k.norm(dim=-1, keepdim=True) + eps)
+                q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
+                k_norm = k.to(torch.float32).norm(dim=-1, keepdim=True)
+                q = q / (q_norm.to(q.dtype) + eps)
+                k = k / (k_norm.to(k.dtype) + eps)
+                # compensate SDP's internal 1/sqrt(d) scaling (so logits stay O(1))
                 scale = math.sqrt(self.head_dim)
                 q = q * scale
                 k = k * scale
             elif self.qk_norm in ("rms", "rmsnorm"):
-                q = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + eps)
-                k = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + eps)
+                q_rms = q.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+                k_rms = k.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+                q = (q * torch.rsqrt(q_rms + eps).to(q.dtype)) * self.q_norm_weight
+                k = (k * torch.rsqrt(k_rms + eps).to(k.dtype)) * self.k_norm_weight
             elif self.qk_norm in ("layernorm", "ln"):
-                q = F.layer_norm(q, (self.head_dim,), eps=eps)
-                k = F.layer_norm(k, (self.head_dim,), eps=eps)
+                q = F.layer_norm(q, (self.head_dim,), weight=self.q_norm_weight, bias=self.q_norm_bias, eps=eps)
+                k = F.layer_norm(k, (self.head_dim,), weight=self.k_norm_weight, bias=self.k_norm_bias, eps=eps)
             else:
                 raise ValueError(f"Unknown attn_qk_norm: {self.qk_norm}")
             

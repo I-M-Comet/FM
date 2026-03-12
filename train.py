@@ -362,6 +362,7 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--ema_momentum", type=float, default=None)
 
     # model-side ablations
+    p.add_argument("--attn_qk_norm", type=str, default=None)  # off | l2 | rms | layernorm")
     p.add_argument("--mlp_type", type=str, default=None)
     p.add_argument("--norm_type", type=str, default=None)
     p.add_argument("--layerscale_init", type=float, default=None)
@@ -532,6 +533,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     if args.n_layers is not None: model_cfg.n_layers = args.n_layers
     if args.n_heads is not None: model_cfg.n_heads = args.n_heads
 
+    if args.attn_qk_norm is not None:
+        model_cfg.attn_qk_norm = str(args.attn_qk_norm)
     if args.mlp_type is not None:
         model_cfg.mlp_type = str(args.mlp_type)
     if args.norm_type is not None:
@@ -685,6 +688,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         cache_max_bytes=train_cfg.cache_max_bytes,
         post_split_shuffle=train_cfg.post_split_shuffle,
         eviction_interval=train_cfg.eviction_interval,
+        data_mode=getattr(train_cfg, "data_mode", "finite"),
+        seed=train_cfg.seed,
     )
 
     # bucket batching
@@ -805,11 +810,15 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         mv_pairs_sum = torch.zeros((), device=dev, dtype=torch.float32)
         mv_loss_pairs_sum = torch.zeros((), device=dev, dtype=torch.float32)  # sum(loss_i) over paired samples
 
+    passes_completed = 0
     start_time = time.time()
     while global_step < train_cfg.max_steps:
         try:
             batch = next(it)
         except StopIteration:
+            passes_completed += 1
+            if accelerator.is_main_process:
+                pbar.write(f"[data] pass {passes_completed} completed. Restarting data loader.")
             it = iter(loader)
             batch = next(it)
 
