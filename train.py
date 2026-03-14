@@ -811,6 +811,10 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         mv_loss_pairs_sum = torch.zeros((), device=dev, dtype=torch.float32)  # sum(loss_i) over paired samples
 
     passes_completed = 0
+    pass_input_tokens = 0
+    pass_target_tokens = 0
+    pass_context_tokens = 0
+    pass_eff_target_tokens = 0
     start_time = time.time()
     while global_step < train_cfg.max_steps:
         try:
@@ -818,7 +822,13 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         except StopIteration:
             passes_completed += 1
             if accelerator.is_main_process:
-                pbar.write(f"[data] pass {passes_completed} completed. Restarting data loader.")
+                pbar.write(f"[data] pass {passes_completed} completed. Step: {global_step}")
+                pbar.write(f"Input Tokens: {pass_input_tokens}, Target Tokens: {pass_target_tokens}, Context Tokens: {pass_context_tokens}")
+                pbar.write(f"Effective Target Tokens: {pass_eff_target_tokens}, Step Equivalent Tokens: {pass_eff_target_tokens/train_cfg.tokens_per_update:.2f}")
+                pass_input_tokens = 0
+                pass_target_tokens = 0
+                pass_context_tokens = 0
+                pass_eff_target_tokens = 0
             it = iter(loader)
             batch = next(it)
 
@@ -1169,7 +1179,11 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                             proxy_last_tgt_feat_std = tgt_f.std(unbiased=False)
 
             accelerator.backward(loss_scaled)
-
+        
+        pass_input_tokens += int(valid.sum().item())
+        pass_target_tokens += int(target_mask.sum().item())
+        pass_context_tokens += int(context_mask.sum().item())
+        pass_eff_target_tokens += int(tokens_eff_this)
         # update accumulation stats
         if manual_accum:
             accum_tokens += int(tokens_this)

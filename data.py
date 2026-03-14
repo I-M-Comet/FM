@@ -8,6 +8,7 @@ import json
 import numpy as np
 import os
 import random
+import math
 import shutil
 import torch
 
@@ -43,6 +44,16 @@ def find_shards(data_root: str, shard_glob: str) -> List[str]:
     pat = os.path.join(data_root, shard_glob)
     shards = sorted(glob.glob(pat, recursive=True))
     return shards
+
+
+def _annotate_tokens(ex: Dict[str, Any], patch_samples: int, hop_samples: int) -> Dict[str, Any]:
+    eeg = ex["eeg"]
+    C, T = eeg.shape
+    P_t = compute_num_patches(T, patch_samples=patch_samples, hop_samples=hop_samples)
+    ex["n_tokens"] = int(C * P_t)
+    ex["n_patches"] = int(P_t)
+    ex["n_channels"] = int(C)
+    return ex
 
 
 def _as_torch(x: Any) -> torch.Tensor:
@@ -130,149 +141,122 @@ def compute_num_patches(T: int, patch_samples: int, hop_samples: int) -> int:
     return int((T - patch_samples) // hop_samples + 1)
 
 
-def maybe_random_window_crop_60s(
-    ex: Dict[str, Any],
-    crop_prob: float,
-    crop_30_prob: float,
-    align_to_seconds: bool = True,   # 추가: 1초 경계로 자를지
-) -> Dict[str, Any]:
-    if crop_prob <= 0:
-        return ex
-
-    eeg: torch.Tensor = ex["eeg"]
-    meta: Dict[str, Any] = ex.get("meta", {})
-
-    fs = int(meta.get("fs", 200)) or 200
-    duration_sec = int(eeg.shape[-1] // fs)
-
-    if duration_sec != 60:
-        return ex
-    if random.random() >= float(crop_prob):
-        return ex
-
-    crop_sec = 30 if (random.random() < float(crop_30_prob)) else 10
-    crop_samples = int(crop_sec * fs)
-    C, T = eeg.shape
-    if T < crop_samples:
-        return ex
-
-    if align_to_seconds:
-        start_sec = random.randint(0, 60 - crop_sec)
-        start = start_sec * fs
-    else:
-        start = random.randint(0, T - crop_samples)
-        start_sec = start / fs
-
-    eeg2 = eeg[:, start : start + crop_samples].contiguous()
-
-    # ✅ 기존 필드 유지
-    out = dict(ex)
-    out["eeg"] = eeg2
-
-    meta2 = dict(meta)
-    meta2["duration_sec"] = int(crop_sec)
-    meta2["parent_duration_sec"] = int(duration_sec)
-    meta2["crop_start"] = int(start)
-    meta2["crop_start_sec"] = float(start_sec)
-    meta2["cropped_from_long_window"] = True
-    out["meta"] = meta2
-
-    # (선택) key를 바꿔서 디버깅/분석에 도움
-    # if "__key__" in out and isinstance(out["__key__"], str):
-    #     out["__key__"] = f"{out['__key__']}_t{int(start_sec):02d}_d{crop_sec:02d}"
-
-    return out
-
-
-def maybe_group_channels(
-    ex: Dict[str, Any],
+def _split_one_view_to_fit(
+    ex,
     max_tokens: int,
     patch_samples: int,
     hop_samples: int,
-    prefer_durations_sec: tuple = (10, 30, 60),   # 너의 정책 반영
-) -> Dict[str, Any]:
-    """
-    기존: max_tokens 초과 시 채널을 K로 줄임
-    변경: 채널은 유지하고, 필요 시 시간 길이를 crop 해서 P_t를 줄임 (예: 60s -> 30s)
-    """
-    eeg: torch.Tensor = ex["eeg"]      # (C,T)
-    coord: torch.Tensor = ex["coord"]  # (C,3)
-    meta: Dict[str, Any] = ex.get("meta", {})
+    prefer_chunk_sec=(30, 10),
+):
+    eeg = ex["eeg"]
+    meta = ex.get("meta", {})
+    fs = int(meta.get("fs", 200)) or 200
 
     C, T = eeg.shape
-    P_t = compute_num_patches(T, patch_samples=patch_samples, hop_samples=hop_samples)
-    if P_t <= 0:
-        ex["n_tokens"] = 0
-        ex["n_patches"] = 0
-        ex["n_channels"] = int(C)
-        return ex
+    P = compute_num_patches(T, patch_samples=patch_samples, hop_samples=hop_samples)
+    if P <= 0:
+        return []
 
-    N = C * P_t
-    if N <= max_tokens:
-        ex["n_tokens"] = int(N)
-        ex["n_patches"] = int(P_t)
-        ex["n_channels"] = int(C)
-        return ex
+    if C * P <= max_tokens:
+        return [_annotate_tokens(ex, patch_samples, hop_samples)]
 
-    # ---- 토큰 초과: 채널 유지, P를 줄이기 ----
-    P_max = max_tokens // C  # 허용 가능한 최대 패치 수
+    P_max = max_tokens // C
     if P_max < 1:
-        # 이 케이스는 C가 너무 커서 1패치도 못 넣는 상황.
-        # 너의 데이터(C<=134)에서는 사실상 안 생김.
-        ex["n_tokens"] = 0
-        ex["n_patches"] = 0
-        ex["n_channels"] = int(C)
-        return ex
+        return []
 
-    # prefer durations 중 "가능한 가장 긴 길이" 선택 (예: 60->30)
-    fs = int(meta.get("fs", 200))  # 전처리에서 200Hz 고정이라면 200으로 fallback OK
-    best_P = None
-    best_Tneed = None
+    # 가능한 clean chunk 우선 (30초, 10초)
+    chunk_P = None
+    for sec in prefer_chunk_sec:
+        P_sec = compute_num_patches(sec * fs, patch_samples=patch_samples, hop_samples=hop_samples)
+        if 0 < P_sec <= P_max and P_sec <= P:
+            chunk_P = P_sec
+            break
 
-    for sec in prefer_durations_sec:
-        T_sec = sec * fs
-        P_sec = compute_num_patches(T_sec, patch_samples=patch_samples, hop_samples=hop_samples)
-        if P_sec <= P_max and P_sec <= P_t:
-            if best_P is None or P_sec > best_P:
-                best_P = P_sec
-                best_Tneed = (P_sec - 1) * hop_samples + patch_samples
+    if chunk_P is None:
+        chunk_P = min(P, P_max)
 
-    if best_P is None:
-        # prefer durations로 안 되면, P_max에 맞춰 crop (일반적 fallback)
-        P_new = min(P_t, P_max)
-        T_need = (P_new - 1) * hop_samples + patch_samples
-    else:
-        P_new = best_P
-        T_need = best_Tneed
+    outs = []
+    n_chunks = math.ceil(P / chunk_P)
+    parent_uid = str(meta.get("__key__", "")) or str(meta.get("__url__", ""))
 
-    if T_need <= 0:
-        ex["n_tokens"] = 0
-        ex["n_patches"] = 0
-        ex["n_channels"] = int(C)
-        return ex
+    for i in range(n_chunks):
+        p0 = i * chunk_P
+        curP = min(chunk_P, P - p0)
+        start = p0 * hop_samples
+        T_need = (curP - 1) * hop_samples + patch_samples
 
-    # 랜덤 crop (다양성 확보)
-    if T > T_need:
-        start = random.randint(0, T - T_need)
-    else:
-        start = 0
+        out = dict(ex)
+        out["eeg"] = eeg[:, start:start + T_need].contiguous()
 
-    eeg = eeg[:, start:start + T_need].contiguous()
+        meta2 = dict(meta)
+        meta2["parent_uid"] = parent_uid
+        meta2["token_fit_split"] = True
+        meta2["token_fit_split_idx"] = i
+        meta2["token_fit_split_of"] = n_chunks
+        meta2["view_type"] = "local" if n_chunks > 1 else meta2.get("view_type", "global")
+        out["meta"] = meta2
 
-    ex["eeg"] = eeg
-    ex["coord"] = coord
-    # meta 업데이트(디버깅/추적용)
-    ex["meta"] = dict(meta)
-    ex["meta"]["cropped_to_fit_tokens"] = True
-    ex["meta"]["crop_start"] = int(start)
+        outs.append(_annotate_tokens(out, patch_samples, hop_samples))
 
-    # 재계산
-    P_t2 = compute_num_patches(eeg.shape[1], patch_samples=patch_samples, hop_samples=hop_samples)
-    ex["n_tokens"] = int(C * P_t2)
-    ex["n_patches"] = int(P_t2)
-    ex["n_channels"] = int(C)
-    return ex
+    return outs
 
+
+def split_long_and_fit(
+    ex,
+    crop_prob: float,
+    crop_30_prob: float,
+    max_tokens: int,
+    patch_samples: int,
+    hop_samples: int,
+):
+    eeg = ex["eeg"]
+    meta = ex.get("meta", {})
+    fs = int(meta.get("fs", 200)) or 200
+
+    C, T = eeg.shape
+    duration_sec = int(T // fs)
+    parent_uid = str(meta.get("__key__", "")) or str(meta.get("__url__", ""))
+
+    # 1) long-crop policy: replace with non-overlapping views, but keep all information
+    base_views = [(0, T, False, "global")]   # (start, length, multicrop, view_type)
+
+    if duration_sec == 60 and crop_prob > 0 and random.random() < float(crop_prob):
+        crop_sec = 30 if (random.random() < float(crop_30_prob)) else 10
+        chunk = crop_sec * fs
+        n = math.ceil(T / chunk)
+
+        base_views = []
+        for i in range(n):
+            s = i * chunk
+            curT = min(chunk, T - s)
+            base_views.append((s, curT, True, "local"))
+
+    # 2) each base view must still satisfy max_tokens
+    outs = []
+    for j, (s, curT, multicrop, view_type) in enumerate(base_views):
+        out = dict(ex)
+        out["eeg"] = eeg[:, s:s + curT].contiguous()
+
+        meta2 = dict(meta)
+        meta2["parent_uid"] = parent_uid
+        meta2["multicrop"] = multicrop
+        meta2["view_type"] = view_type
+        meta2["long_view_idx"] = j
+        meta2["long_view_of"] = len(base_views)
+        meta2["duration_sec"] = int(curT // fs)
+        out["meta"] = meta2
+
+        outs.extend(
+            _split_one_view_to_fit(
+                out,
+                max_tokens=max_tokens,
+                patch_samples=patch_samples,
+                hop_samples=hop_samples,
+                prefer_chunk_sec=(30, 10),
+            )
+        )
+
+    return outs
 
 def collate_stack(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: int) -> Dict[str, Any]:
     """
@@ -625,16 +609,8 @@ def build_webdataset(
         )
 
     def _prep(ex):
-        if enable_channel_grouping:
-            ex = maybe_group_channels(ex, max_tokens=max_tokens, patch_samples=patch_samples, hop_samples=hop_samples)
-        else:
-            eeg = ex["eeg"]
-            C, T = eeg.shape
-            P_t = compute_num_patches(T, patch_samples=patch_samples, hop_samples=hop_samples)
-            ex["n_tokens"] = int(C * P_t)
-            ex["n_patches"] = int(P_t)
-            ex["n_channels"] = int(C)
-        return ex
+        return _annotate_tokens(ex, patch_samples=patch_samples, hop_samples=hop_samples)
+    
     if data_mode == "resampled":
     # ---- Recommended pipeline: shard-level shuffle -> split_by_node/worker -> (optional) cache -> tar -> sample shuffle(before decode) ----
         src = wds.ResampledShards(shards)  # infinite pretrain
@@ -679,9 +655,15 @@ def build_webdataset(
         wds.decode(),
         wds.map(decode_sample),  # 여기서 torch로 변환
     ]
-    if long_crop_prob and long_crop_prob > 0:
-        pipeline.append(wds.map(lambda ex: maybe_random_window_crop_60s(ex, crop_prob=long_crop_prob, crop_30_prob=long_crop_30_prob)))
-    # small shuffle after crop/split
+    pipeline.append(
+        _flatmap_stage(
+        lambda ex: split_long_and_fit(
+        ex,
+        crop_prob=long_crop_prob,
+        crop_30_prob=long_crop_30_prob,
+        max_tokens=max_tokens,
+        patch_samples=patch_samples,
+        hop_samples=hop_samples,)))
     pipeline += [
         wds.shuffle(post_split_shuffle),
         wds.map(_prep),

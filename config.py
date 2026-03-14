@@ -136,7 +136,7 @@ class TrainConfig:
     eviction_interval: int = 8
 
     # Long-segment (60s) handling
-    long_crop_prob: float = 0.2
+    long_crop_prob: float = 0.0
     long_crop_30_prob: float = 0.5
     enable_channel_grouping: bool = True
 

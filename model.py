@@ -1123,11 +1123,14 @@ class EEGEncoder(nn.Module):
                 coord_jitter_prob=cfg.coord_jitter_prob,
                 w_init=cfg.coord_w_init,
             )
-        self.film = FiLMFusion(
-            freq_dim=self.freq_feat.freq_dim,
-            d_model=cfg.d_model,
-            hidden=cfg.film_hidden,
-        )
+        if cfg.film_hidden > 0:
+            self.film = FiLMFusion(
+                freq_dim=self.freq_feat.freq_dim,
+                d_model=cfg.d_model,
+                hidden=cfg.film_hidden,
+            )
+        else:
+            self.film = None
 
         # shared spatial bias module (computed once per forward and reused across blocks)
         self.spatial_bias = SpatialBias(cfg)
@@ -1217,27 +1220,30 @@ class EEGEncoder(nn.Module):
         e = e_time + coord_tok
 
         # freq features
-        f = self.freq_feat.forward_packed(patches)  # (B,L,F)
+        if self.film is not None:
+            f = self.freq_feat.forward_packed(patches)  # (B,L,F)
 
-        # apply freq corruption (only intended for student)
-        if freq_domain_drop is not None:
-            # drop all freq dims (including scale) for dropped samples
-            drop = freq_domain_drop.to(device=device, dtype=torch.bool)[:, None]  # (B,1)
-            f = f.masked_fill(drop[..., None] & (~pad)[..., None], 0.0)
+            # apply freq corruption (only intended for student)
+            if freq_domain_drop is not None:
+                # drop all freq dims (including scale) for dropped samples
+                drop = freq_domain_drop.to(device=device, dtype=torch.bool)[:, None]  # (B,1)
+                f = f.masked_fill(drop[..., None] & (~pad)[..., None], 0.0)
 
-        if freq_mask_bins is not None:
-            # only mask the first K bins; keep optional scale dim intact
-            K = self.cfg.freq_bins
-            band = freq_mask_bins.to(device=device, dtype=torch.bool)  # (B,K)
-            band = band[:, None, :]  # (B,1,K)
-            f_shape = f[..., :K].masked_fill(band & (~pad[..., None]), 0.0)
-            if f.shape[-1] > K:
-                f = torch.cat([f_shape, f[..., K:]], dim=-1)
-            else:
-                f = f_shape
+            if freq_mask_bins is not None:
+                # only mask the first K bins; keep optional scale dim intact
+                K = self.cfg.freq_bins
+                band = freq_mask_bins.to(device=device, dtype=torch.bool)  # (B,K)
+                band = band[:, None, :]  # (B,1,K)
+                f_shape = f[..., :K].masked_fill(band & (~pad[..., None]), 0.0)
+                if f.shape[-1] > K:
+                    f = torch.cat([f_shape, f[..., K:]], dim=-1)
+                else:
+                    f = f_shape
 
-        # FiLM fuse
-        tok = self.film(e, f)
+            # FiLM fuse
+            tok = self.film(e, f)
+        else:
+            tok = e
         tok = tok.masked_fill(pad[..., None], 0.0)
 
         rope_pos = t_safe  # (B,L) patch indices
