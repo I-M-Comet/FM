@@ -95,6 +95,13 @@ class EEGModelConfig:
     # --------- Mask token ----------
     mask_token_init_std: float = 0.02
 
+    # kernelized spatial Q/K branch
+    spatial_qk_type: str = "none"   # "none" | "legendre_anchor"
+    spatial_qk_num_anchors: int = 32
+    spatial_qk_degree: int = 8
+    spatial_qk_feat_dim: int = 64
+    spatial_qk_scale: float = 1.0
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -174,6 +181,20 @@ class TrainConfig:
     aug_noise_std_max: float = 0.03
     aug_channel_drop_prob: float = 0.00
 
+    # --------- freq options ----------
+    spec_aux_mode: str = "off"            # "off" | "layer_align" | "relational"
+    spec_align_weight: float = 0.05
+    spec_align_warmup_steps: int = 800
+    spec_align_ramp_steps: int = 1200
+    spec_align_layer_indices: Any = "all" # or [-2, -1]
+    spec_rel_proj_dim: int = 128
+    spec_rel_subsample_tokens: int = 512
+    spec_rel_tau_z: float = 0.1
+    spec_rel_tau_s: float = 0.1
+    spec_rel_weight: float = 0.05
+    spec_rel_warmup_steps: int = 800
+    spec_rel_ramp_steps: int = 1200
+
     # --------- Freq corruption (student only) ----------
     freq_domain_drop_prob: float = 0.25
     freq_physio_mask_prob: float = 0.6
@@ -195,6 +216,8 @@ class TrainConfig:
 
     max_steps: int = 200_000
     warmup_steps: int = 5_000
+    schedule_total_steps: int = 0
+    ema_total_steps: int = 0
 
     # --------- LR schedule ----------
     # Baseline: cosine warmup over steps (existing behavior)
@@ -243,6 +266,12 @@ class TrainConfig:
 
     # Debug / small runs
     limit_num_samples: int = 0
+
+    # --------- Window / manifest ----------
+    window_manifest: Optional[str] = None   # path to open_eeg_stage_manifest.json
+    window_id: int = -1                     # fixed window id for this run; -1 means unused
+    use_resident_shards: bool = True
+    shards_txt: Optional[str] = None        # preferred if staging to SSD
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

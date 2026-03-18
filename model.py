@@ -13,6 +13,117 @@ import torch.nn.functional as F
 from .config import EEGModelConfig
 
 
+def _gather_channel_features(x_ch: torch.Tensor, c_idx: torch.Tensor) -> torch.Tensor:
+    """
+    x_ch: (B,C,F)
+    c_idx: (B,L)
+    returns: (B,L,F)
+    """
+    B, C, F = x_ch.shape
+    B2, L = c_idx.shape
+    assert B == B2
+    idx = c_idx[..., None].expand(B, L, F)
+    return x_ch.gather(dim=1, index=idx)
+
+
+class LegendreAnchorFeatures(nn.Module):
+    """
+    Practical low-rank spherical feature map:
+      phi_r(u) = sum_{l=0}^L w_{r,l} P_l(u · a_r)
+    where a_r are learnable anchor directions on the unit sphere.
+
+    Output shape:
+      (B, C, F) where F = spatial_qk_feat_dim
+    """
+    def __init__(self, cfg: EEGModelConfig):
+        super().__init__()
+        self.num_anchors = int(getattr(cfg, "spatial_qk_num_anchors", 32))
+        self.degree = int(getattr(cfg, "spatial_qk_degree", getattr(cfg, "spatial_bias_degree", 8)))
+        self.out_dim = int(getattr(cfg, "spatial_qk_feat_dim", 64))
+        self.use_unit = bool(getattr(cfg, "spatial_bias_use_unit_sphere", True))
+        self.eps = float(getattr(cfg, "spatial_bias_eps", 1e-6))
+
+        # learnable anchor directions on sphere
+        anchors = torch.randn(self.num_anchors, 3)
+        anchors = F.normalize(anchors, p=2, dim=-1)
+        self.anchors = nn.Parameter(anchors)
+
+        # per-anchor Legendre coefficients
+        self.coeff = nn.Parameter(torch.zeros(self.num_anchors, self.degree + 1))
+
+        self.proj = nn.Linear(self.num_anchors, self.out_dim, bias=False)
+        self.norm = nn.LayerNorm(self.out_dim)
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        coords: (B, C, 3)
+        returns: (B, C, F)
+        """
+        if self.use_unit:
+            u = coords / coords.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+        else:
+            u = coords
+
+        a = F.normalize(self.anchors, p=2, dim=-1)  # (R, 3)
+        x = torch.einsum("bcd,rd->bcr", u.float(), a.float()).clamp(-1.0, 1.0)  # (B,C,R)
+
+        # Legendre basis along each anchor
+        basis = []
+        Pm2 = torch.ones_like(x)
+        basis.append(Pm2)
+
+        if self.degree >= 1:
+            Pm1 = x
+            basis.append(Pm1)
+
+            for l in range(2, self.degree + 1):
+                Pl = ((2 * l - 1) * x * Pm1 - (l - 1) * Pm2) / float(l)
+                basis.append(Pl)
+                Pm2, Pm1 = Pm1, Pl
+
+        basis = torch.stack(basis, dim=-1)  # (B,C,R,L+1)
+        coeff = self.coeff[None, None, :, :].to(dtype=basis.dtype, device=basis.device)
+        feat = (basis * coeff).sum(dim=-1)  # (B,C,R)
+
+        feat = self.proj(feat)
+        feat = self.norm(feat)
+        return feat.to(coords.dtype)
+
+class LayerSpecAlignHeads(nn.Module):
+    """
+    layer-wise hidden -> spectrum-view alignment head
+    target view = fixed raw log-spectrum bins
+    """
+    def __init__(self, n_layers: int, d_model: int, spec_dim: int):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                make_norm("rms", d_model, eps=1e-6),
+                nn.Linear(d_model, spec_dim),
+            )
+            for _ in range(n_layers)
+        ])
+        for h in self.heads:
+            nn.init.zeros_(h[-1].weight)
+            nn.init.zeros_(h[-1].bias)
+
+    def forward_one(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        return self.heads[layer_idx](x)
+
+class Z_Projector(nn.Module):
+    def __init__(self, d_model: int, spec_dim: int):
+        super().__init__()
+        self.heads = nn.Sequential(
+            make_norm("rms", d_model, eps=1e-6),
+            nn.Linear(d_model, spec_dim),
+        )
+
+        nn.init.zeros_(self.heads[-1].weight)
+        nn.init.zeros_(self.heads[-1].bias)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.heads(x)
+
+
 # ============================================================
 # RoPE utilities
 # ============================================================
@@ -398,7 +509,19 @@ class SpatialBias(nn.Module):
 # Attention blocks (PreNorm) with RoPE + Flash SDP
 # ============================================================
 class MultiheadSelfAttentionRoPE(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rope_theta: float, rotary_pct: float, qk_norm: str = "off", qk_norm_eps: float = 1e-6):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        attn_dropout: float,
+        rope_theta: float,
+        rotary_pct: float,
+        qk_norm: str = "off",
+        qk_norm_eps: float = 1e-6,
+        spatial_qk: str = "none",
+        spatial_qk_dim: int = 0, 
+        spatial_qk_scale: float = 1.0,
+    ):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -426,6 +549,16 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         self.out = nn.Linear(d_model, d_model, bias=True)
 
         self._rope_cache = None  # (cos, sin, max_pos, dtype, device)
+
+        self.spatial_qk_dim = int(spatial_qk_dim)
+        self.spatial_qk_scale = float(spatial_qk_scale)
+        self.spatial_qk = str(spatial_qk).lower()
+        if self.spatial_qk != "none":
+            self.spatial_q_proj = nn.Linear(self.spatial_qk_dim, d_model, bias=False)
+            self.spatial_k_proj = nn.Linear(self.spatial_qk_dim, d_model, bias=False)
+        else:
+            self.spatial_q_proj = None
+            self.spatial_k_proj = None
 
     def _get_rope(
         self,
@@ -476,7 +609,8 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         x: torch.Tensor,
         padding_mask: Optional[torch.Tensor],
         rope_pos: Optional[torch.Tensor] = None,
-        attn_bias: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,          # SDPA용 dense bias
+        spatial_qk_tok: Optional[torch.Tensor] = None,     # option 2용, 여기서는 아직 unused
     ) -> torch.Tensor:
         """
         x: (B, N, D)
@@ -504,6 +638,17 @@ class MultiheadSelfAttentionRoPE(nn.Module):
             k_rot = apply_rope(k_rot, cos, sin)
             q = torch.cat([q_rot, q_pass], dim=-1)
             k = torch.cat([k_rot, k_pass], dim=-1)
+
+        if (self.spatial_q_proj is not None) and (spatial_qk_tok is not None):
+            q_sp = self.spatial_q_proj(spatial_qk_tok)  # (B,N,D)
+            k_sp = self.spatial_k_proj(spatial_qk_tok)  # (B,N,D)
+
+            q_sp = q_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+            k_sp = k_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+
+            scale = q.new_tensor(self.spatial_qk_scale)
+            q = q + scale * q_sp
+            k = k + scale * k_sp
 
         # Optional QK normalization (attention stability)
         if self.qk_norm != "off":
@@ -832,6 +977,9 @@ class FullAttentionBlock(nn.Module):
             rotary_pct=cfg.rotary_pct,
             qk_norm=getattr(cfg, "attn_qk_norm", "off"),
             qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
+            spatial_qk=getattr(cfg, "spatial_qk_type", "none"),
+            spatial_qk_dim=getattr(cfg, "spatial_qk_feat_dim", 64),
+            spatial_qk_scale=getattr(cfg, "spatial_qk_scale", 1.0)
         )
 
         self.norm2 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
@@ -845,25 +993,30 @@ class FullAttentionBlock(nn.Module):
             self.ls1 = None
             self.ls2 = None
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        padding_mask: Optional[torch.Tensor],
-        rope_pos: torch.Tensor,
-        chan_idx: Optional[torch.Tensor],
-        spatial_bias_cc: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        # spatial bias on channels -> gather to token-token
+    def forward(self, x, padding_mask, rope_pos, chan_idx, spatial_bias_cc, spatial_qk_ch):
         attn_bias = None
+        spatial_qk_tok = None
+        
+        if (spatial_qk_ch is not None) and (chan_idx is not None):
+            spatial_qk_tok = _gather_channel_features(spatial_qk_ch, chan_idx)
+            if padding_mask is not None:
+                spatial_qk_tok = spatial_qk_tok.masked_fill(padding_mask[..., None], 0.0)
+
         if self.use_spatial_bias and (spatial_bias_cc is not None) and (chan_idx is not None):
-            # token channel indices (PAD already clamped in embed_from_indices)
+            # 기존 dense token-token bias path 유지
             c = chan_idx
             B, N = c.shape
             b = torch.arange(B, device=c.device)[:, None, None]
-            bias_cc = spatial_bias_cc.to(dtype=x.dtype, device=x.device)
-            attn_bias = bias_cc[b, c[:, :, None], c[:, None, :]]  # (B,N,N)
+            bias_cc_local = spatial_bias_cc.to(dtype=x.dtype, device=x.device)
+            attn_bias = bias_cc_local[b, c[:, :, None], c[:, None, :]]  # (B,N,N)
 
-        y = self.attn(self.norm1(x), padding_mask=padding_mask, rope_pos=rope_pos, attn_bias=attn_bias)
+        y = self.attn(
+            self.norm1(x),
+            padding_mask=padding_mask,
+            rope_pos=rope_pos,
+            attn_bias=attn_bias,
+            spatial_qk_tok=spatial_qk_tok,
+        )
         if self.ls1 is not None:
             y = self.ls1(y)
         x = x + self.dropout(y)
@@ -914,6 +1067,9 @@ class DividedSpatiotemporalBlock(nn.Module):
             rotary_pct=0.0,  # no RoPE in spatial pass
             qk_norm=getattr(cfg, "attn_qk_norm", "off"),
             qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
+            spatial_qk=getattr(cfg, "spatial_qk_type", "none"),
+            spatial_qk_dim=getattr(cfg, "spatial_qk_feat_dim", 64),
+            spatial_qk_scale=getattr(cfg, "spatial_qk_scale", 1.0)
         )
 
         # MLP
@@ -1012,6 +1168,7 @@ class DividedSpatiotemporalBlock(nn.Module):
         t_idx: torch.Tensor,        # (B,L)
         c_idx: torch.Tensor,        # (B,L)
         spatial_bias_cc: Optional[torch.Tensor],  # (B,C,C)
+        spatial_qk_ch: Optional[torch.Tensor],
         C: int,
         P: int,
     ) -> torch.Tensor:
@@ -1028,14 +1185,25 @@ class DividedSpatiotemporalBlock(nn.Module):
         if nonempty.any():
             x_sel = x_s[nonempty]
             pad_sel = pad_s[nonempty]
+
+            group_idx = torch.nonzero(nonempty, as_tuple=False).squeeze(-1)
+            b_idx = group_idx // P
+
+            spatial_qk_sel = None
+            if spatial_qk_ch is not None:
+                spatial_qk_sel = spatial_qk_ch.to(dtype=x.dtype, device=x.device)[b_idx]  # (n_sel,C,F)
+
             bias_sel = None
             if spatial_bias_cc is not None:
-                # We avoid materializing (B*P,C,C). Map each non-empty (b,p) group back to b.
-                # x_s is flattened from (B,P,C,D) -> (B*P,C,D), so group_index // P == b.
-                group_idx = torch.nonzero(nonempty, as_tuple=False).squeeze(-1)  # (n_sel,)
-                b_idx = group_idx // P
                 bias_sel = spatial_bias_cc.to(dtype=x.dtype, device=x.device)[b_idx]  # (n_sel,C,C)
-            y_sel = self.attn_s(x_sel, padding_mask=pad_sel, rope_pos=None, attn_bias=bias_sel)
+
+            y_sel = self.attn_s(
+                x_sel,
+                padding_mask=pad_sel,
+                rope_pos=None,
+                attn_bias=bias_sel,
+                spatial_qk_tok=spatial_qk_sel,
+            )
             y_s = x_s.new_zeros(x_s.shape, dtype=y_sel.dtype)
             y_s[nonempty] = y_sel
         else:
@@ -1052,6 +1220,7 @@ class DividedSpatiotemporalBlock(nn.Module):
         rope_pos: torch.Tensor,
         chan_idx: Optional[torch.Tensor],
         spatial_bias_cc: Optional[torch.Tensor],
+        spatial_qk_ch: Optional[torch.Tensor],
     ) -> torch.Tensor:
         if padding_mask is None:
             # assume all valid
@@ -1073,7 +1242,7 @@ class DividedSpatiotemporalBlock(nn.Module):
         x = x + self.dropout(y)
 
         # spatial pass
-        y = self._spatial_pass(self.norm_s(x), padding_mask, rope_pos, chan_idx, spatial_bias_cc=spatial_bias_cc, C=C, P=P)
+        y = self._spatial_pass(self.norm_s(x), padding_mask, rope_pos, chan_idx, spatial_bias_cc=spatial_bias_cc, spatial_qk_ch=spatial_qk_ch, C=C, P=P)
         if self.ls_s is not None:
             y = self.ls_s(y)
         x = x + self.dropout(y)
@@ -1131,6 +1300,10 @@ class EEGEncoder(nn.Module):
             )
         else:
             self.film = None
+        
+        self.spatial_qk_feat = None
+        if str(getattr(cfg, "spatial_qk_type", "none")).lower() == "legendre_anchor":
+            self.spatial_qk_feat = LegendreAnchorFeatures(cfg)
 
         # shared spatial bias module (computed once per forward and reused across blocks)
         self.spatial_bias = SpatialBias(cfg)
@@ -1266,6 +1439,11 @@ class EEGEncoder(nn.Module):
             if spatial_bias_cc is not None:
                 spatial_bias_cc = spatial_bias_cc.to(dtype=tokens.dtype, device=tokens.device)
 
+        spatial_qk_ch = None
+        if (coords is not None) and (self.spatial_qk_feat is not None):
+            spatial_qk_ch = self.spatial_qk_feat(coords)
+            spatial_qk_ch = spatial_qk_ch.to(dtype=tokens.dtype, device=tokens.device)
+
         x = tokens
         for blk in self.blocks:
             x = blk(
@@ -1274,6 +1452,7 @@ class EEGEncoder(nn.Module):
                 rope_pos=rope_pos,
                 chan_idx=chan_idx,
                 spatial_bias_cc=spatial_bias_cc,
+                spatial_qk_ch=spatial_qk_ch,
             )
         x = self.norm(x)
         return x
@@ -1366,14 +1545,21 @@ class CrossAttentionPredictor(nn.Module):
         tgt_coord_emb: torch.Tensor,  # (B,Lt,D)
         tgt_pad: torch.Tensor,        # (B,Lt) True=PAD
         rope_tgt: torch.Tensor,       # (B,Lt) or (Lt,)
+        return_hidden: bool = False,   # NEW
     ) -> torch.Tensor:
         # build target queries
         q = self.query_token[None, None, :].to(tgt_coord_emb.dtype) + tgt_coord_emb
         q = q.masked_fill(tgt_pad[..., None], 0.0)
 
+        hidden_states = []
         for blk in self.blocks:
             q = blk(q, ctx, ctx_pad, rope_q=rope_tgt, rope_ctx=rope_ctx)
+            if return_hidden:
+                hidden_states.append(q)
 
         q = self.norm(q)
         q = q.masked_fill(tgt_pad[..., None], 0.0)
+        
+        if return_hidden:
+            return q, hidden_states
         return q

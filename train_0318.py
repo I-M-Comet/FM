@@ -114,7 +114,7 @@ def relational_kl_loss(z: torch.Tensor, s: torch.Tensor, tau_z: float = 0.1, tau
 # trainer-state helpers
 # =========================
 
-def _default_trainer_state() -> Dict[str, Any]:
+def _default_trainer_state() -> Dict[str, int]:
     return {
         "global_step_next": 0,
         "passes_completed": 0,
@@ -184,11 +184,10 @@ def _save_trainer_state(
         json.dump(d, f)
 
 
-def _load_trainer_state(ckpt_dir: Optional[str]) -> Dict[str, Any]:
+def _load_trainer_state(ckpt_dir: Optional[str]) -> Dict[str, int]:
     d = _default_trainer_state()
     if not ckpt_dir:
         return d
-
     p = os.path.join(ckpt_dir, "trainer_state.json")
     if not os.path.exists(p):
         # backward compatibility: old checkpoints may have data_state.json only
@@ -204,37 +203,7 @@ def _load_trainer_state(ckpt_dir: Optional[str]) -> Dict[str, Any]:
 
     with open(p, "r", encoding="utf-8") as f:
         loaded = json.load(f)
-
-    numeric_keys = {
-        "global_step_next",
-        "passes_completed",
-        "batches_seen_in_pass",
-        "pass_input_tokens",
-        "pass_target_tokens",
-        "pass_context_tokens",
-        "pass_eff_target_tokens",
-        "tokens_seen_total",
-        "schedule_total_steps",
-        "ema_total_steps",
-        "lr_total_tokens",
-        "lr_warmup_tokens",
-        "lr_cooldown_tokens",
-        "current_window_id",
-    }
-    string_keys = {"shard_source", "shard_list_hash"}
-
-    for k, v in loaded.items():
-        if k not in d:
-            continue
-        if k in numeric_keys:
-            try:
-                d[k] = int(v)
-            except Exception:
-                d[k] = 0
-        elif k in string_keys:
-            d[k] = "" if v is None else str(v)
-        else:
-            d[k] = v
+    d.update({k: int(v) for k, v in loaded.items() if k in d})
     return d
 
 
@@ -914,6 +883,10 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     if getattr(args, "no_resident_shards", False):
         train_cfg.use_resident_shards = False
 
+    if (getattr(train_cfg, "window_manifest", None) or getattr(train_cfg, "shards_txt", None)) and int(train_cfg.shard_shuffle) > 0:
+        if accelerator.is_main_process:
+            print(f"[warn] Using manifest/shards_txt with shard_shuffle={train_cfg.shard_shuffle}. "
+                  "Recommended: set shard_shuffle=0 because window membership already randomizes shard mixing.")
 
     resume_state_dir = _resolve_accelerator_state_dir(getattr(train_cfg, "resume_from", None))
     resume_ckpt_dir = _resolve_ckpt_dir_from_state_dir(resume_state_dir) if resume_state_dir else None
@@ -936,13 +909,6 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         log_with="wandb" if train_cfg.use_wandb else None,
         project_dir=train_cfg.output_dir,
     )
-
-    if (getattr(train_cfg, "window_manifest", None) or getattr(train_cfg, "shards_txt", None)) and int(train_cfg.shard_shuffle) > 0:
-        if accelerator.is_main_process:
-            print(
-                f"[warn] Using manifest/shards_txt with shard_shuffle={train_cfg.shard_shuffle}. "
-                "Recommended: set shard_shuffle=0 because window membership already randomizes shard mixing."
-            )
 
     if accelerator.is_main_process:
         os.makedirs(train_cfg.output_dir, exist_ok=True)
@@ -1124,6 +1090,29 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     predictor.train()
     teacher.eval()
 
+    pbar = tqdm(total=train_cfg.max_steps, disable=not accelerator.is_local_main_process)
+    if resume_state_dir and int(global_step) >= int(train_cfg.max_steps):
+        if accelerator.is_main_process:
+            print(f"[resume] resume_step ({global_step}) >= max_steps ({train_cfg.max_steps}). Nothing to do.")
+        return _build_train_artifacts(train_cfg)
+
+    it = iter(loader)
+
+    # restore dataloader cursor inside the current finite pass
+    if resume_state_dir and batches_seen_in_pass > 0:
+        if accelerator.is_main_process:
+            print(f"[resume] restoring current finite pass cursor: skip {batches_seen_in_pass} batches")
+        try:
+            it = _skip_batches(it, batches_seen_in_pass)
+        except StopIteration:
+            raise RuntimeError(
+                f"Resume cursor invalid: tried to skip {batches_seen_in_pass} batches "
+                f"but the finite loader exhausted early."
+            )
+
+    if global_step > 0:
+        pbar.update(global_step)
+
     # ---------------------------------
     # accumulation state
     # ---------------------------------
@@ -1135,7 +1124,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         budget_tokens = int(max(1, grad_accum_steps))
         accum_basis = "micro"
 
-    # checkpoints are written only at optimizer-step boundaries, so accumulation state always restarts cleanly
+    # these are always fresh on resume because checkpoints are saved only on optimizer-step boundaries
     accum_tokens = 0
     accum_micro = 0
     accum_bucket_keys = set()
@@ -1144,8 +1133,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     # ---------------------------------
     # schedule horizons (decoupled from this session's stop point)
     # ---------------------------------
-    # train_cfg.max_steps = where to stop *this* run
-    # schedule_total_steps = what horizon LR/EMA schedules should assume
+    # train_cfg.max_steps = "where to stop this run"
+    # schedule_total_steps = "what total horizon the schedules should assume"
     schedule_total_steps = int(
         getattr(train_cfg, "schedule_total_steps", 0)
         or resume_trainer_state.get("schedule_total_steps", 0)
@@ -1157,6 +1146,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         or schedule_total_steps
     )
 
+    # token-based LR schedule state (optional)
     lr_sched = str(getattr(train_cfg, "lr_schedule", "cosine")).lower().strip()
     if lr_sched == "token_wcc" and (not use_token_budget or budget_tokens <= 0):
         if accelerator.is_main_process:
@@ -1201,34 +1191,10 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         else 0
     )
 
-    dev = accelerator.device
-
-    pbar = tqdm(total=train_cfg.max_steps, disable=not accelerator.is_local_main_process)
-    if resume_state_dir and int(global_step) >= int(train_cfg.max_steps):
-        if accelerator.is_main_process:
-            print(f"[resume] resume_step ({global_step}) >= max_steps ({train_cfg.max_steps}). Nothing to do.")
-        return _build_train_artifacts(train_cfg)
-
-    it = iter(loader)
-
-    # restore dataloader cursor inside the current finite pass
-    if resume_state_dir and batches_seen_in_pass > 0:
-        if accelerator.is_main_process:
-            print(f"[resume] restoring current finite pass cursor: skip {batches_seen_in_pass} batches")
-        try:
-            it = _skip_batches(it, batches_seen_in_pass)
-        except StopIteration:
-            raise RuntimeError(
-                f"Resume cursor invalid: tried to skip {batches_seen_in_pass} batches "
-                f"but the finite loader exhausted early."
-            )
-
-    if global_step > 0:
-        pbar.update(global_step)
-
     # cheap proxy accumulators (per optimizer step)
     proxy_enabled = bool(getattr(train_cfg, "log_proxies", True))
     if proxy_enabled:
+        dev = accelerator.device
         proxy_n = torch.zeros((), device=dev, dtype=torch.float32)
         proxy_cos_sum = torch.zeros((), device=dev, dtype=torch.float32)
         proxy_pred_norm_sum = torch.zeros((), device=dev, dtype=torch.float32)
@@ -1242,6 +1208,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     # VICReg logging accumulators (per optimizer step)
     vic_log = float(getattr(train_cfg, "vicreg_weight", 0.0) or 0.0) > 0
     if vic_log:
+        dev = accelerator.device
         vic_loss_sum = torch.zeros((), device=dev, dtype=torch.float32)
         vic_var_sum = torch.zeros((), device=dev, dtype=torch.float32)
         vic_cov_sum = torch.zeros((), device=dev, dtype=torch.float32)
@@ -1878,9 +1845,6 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
             lr_total_tokens=resolved_lr_total_tokens,
             lr_warmup_tokens=resolved_lr_warmup_tokens,
             lr_cooldown_tokens=resolved_lr_cooldown_tokens,
-            shard_source=shard_ctx["shard_source"],
-            current_window_id=shard_ctx["current_window_id"],
-            shard_list_hash=shard_ctx["shard_list_hash"],
         )
     accelerator.save_state(os.path.join(final_dir, "accelerator_state"))
 

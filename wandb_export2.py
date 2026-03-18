@@ -7,7 +7,7 @@ api = wandb.Api()
 # 2. 본인의 정보 및 타겟 그룹명 입력
 entity = "minsukim207"      # 계정명 또는 팀명
 project = "eeg_fm"    # 프로젝트명
-starts_with = "eval_A3"   
+starts_with = "eval_A4_0"   
 
 runs = api.runs(
     f"{entity}/{project}"

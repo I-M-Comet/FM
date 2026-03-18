@@ -7,7 +7,7 @@ api = wandb.Api()
 # 💡 본인의 WandB 엔티티(계정명)와 프로젝트명으로 반드시 변경해 줘!
 ENTITY = "minsukim207"   
 PROJECT = "eeg_fm"
-STARTS_WITH = "A3"  # ★ 여기에 지정했던 그룹명을 입력해!
+STARTS_WITH = "A4_0"  # ★ 여기에 지정했던 그룹명을 입력해!
 runs = api.runs(f"{ENTITY}/{PROJECT}") 
 
 # 추가로 뽑고 싶은 특정 지표들
