@@ -291,6 +291,154 @@ def sample_jepa_target_mask(
 
 
 @torch.no_grad()
+def _random_nonneg_composition_cpu(total: int, parts: int) -> torch.Tensor:
+    g = torch.zeros((parts,), dtype=torch.long)
+    if total <= 0 or parts <= 0:
+        return g
+    idx = torch.randint(0, parts, (total,), dtype=torch.long)
+    g.scatter_add_(0, idx, torch.ones((total,), dtype=torch.long))
+    return g
+
+
+@torch.no_grad()
+def sample_time_mask_style3_same_shape_cpu(
+    B: int,
+    C: int,
+    P: int,
+    ratio_min: float,
+    ratio_max: float,
+) -> torch.Tensor:
+    """
+    Train fast path for ShapeBatcher output:
+      - all samples share the same (C, P)
+      - style == 3 only
+      - CPU only (worker-side)
+
+    Returns:
+      mask: (B, C, P), True=target(masked)
+    """
+    mask = torch.zeros((B, C, P), dtype=torch.bool)
+    if B <= 0 or C <= 0 or P <= 0:
+        return mask
+
+    frac = torch.empty((B,), dtype=torch.float32).uniform_(ratio_min, ratio_max)
+    num_masked = torch.round(frac * P).to(torch.long).clamp_(0, P)
+    num_kept = P - num_masked
+    num_blocks = max(1, P // 10)  # keep same policy as your current style-3
+
+    for b in range(B):
+        nk = int(num_kept[b])
+        nm = int(num_masked[b])
+
+        if nk <= 0:
+            mask[b].fill_(True)
+            continue
+        if nm <= 0:
+            continue
+
+        actual_blocks = min(num_blocks, nk)
+        base = nk // actual_blocks
+        rem = nk - base * actual_blocks
+
+        kept_lengths = torch.full((actual_blocks,), base, dtype=torch.long)
+        kept_lengths[-1] += rem
+        gaps = _random_nonneg_composition_cpu(nm, actual_blocks + 1)
+
+        row = torch.ones((P,), dtype=torch.bool)
+        pos = int(gaps[0])
+        for i in range(actual_blocks):
+            li = int(kept_lengths[i])
+            row[pos:pos + li] = False
+            pos += li + int(gaps[i + 1])
+
+        mask[b] = row.unsqueeze(0).expand(C, P)
+
+    return mask
+
+
+@torch.no_grad()
+def sample_spatial_block_mask_same_shape_cpu(
+    coords: torch.Tensor,   # (B, C, 3), CPU
+    P_t: int,
+    ratio_min: float,
+    ratio_max: float,
+) -> torch.Tensor:
+    """
+    Same-shape CPU fast path.
+    All channels are valid because ShapeBatcher batches exact (C, P).
+    """
+    B, C, _ = coords.shape
+    base = torch.zeros((B, C), dtype=torch.bool)
+    if B <= 0 or C <= 0 or P_t <= 0:
+        return base.unsqueeze(-1).expand(B, C, max(P_t, 1))
+
+    frac = torch.empty((B,), dtype=torch.float32).uniform_(ratio_min, ratio_max)
+    k = torch.round(frac * C).to(torch.long).clamp_(1, C)
+    centers = torch.randint(0, C, (B,), dtype=torch.long)
+
+    for b in range(B):
+        center = coords[b, centers[b]]
+        d = torch.sum((coords[b] - center[None, :]) ** 2, dim=-1)
+        nn = torch.topk(d, int(k[b]), largest=False).indices
+        base[b, nn] = True
+
+    return base.unsqueeze(-1).expand(B, C, P_t)
+
+
+@torch.no_grad()
+def sample_jepa_target_mask_same_shape_style3_cpu(
+    coords: torch.Tensor,   # (B, C, 3), CPU
+    P_t: int,
+    mask_time_prob: float,
+    mask_spatial_prob: float,
+    time_ratio_range: Tuple[float, float],
+    spatial_ratio_range: Tuple[float, float],
+    dilate_time: int = 0,
+) -> torch.Tensor:
+    """
+    Fast worker-side path for current train setup:
+      - ShapeBatcher guarantees same (C, P)
+      - style-3 only
+      - no valid_chan / valid_time construction needed
+      - no device roundtrip
+    """
+    assert coords.device.type == "cpu", "worker fast path is intended for CPU tensors"
+
+    B, C, _ = coords.shape
+    target = torch.zeros((B, C, P_t), dtype=torch.bool)
+    if B <= 0 or C <= 0 or P_t <= 0:
+        return target
+
+    use_time = torch.rand((B,), dtype=torch.float32) < float(mask_time_prob)
+    use_spat = torch.rand((B,), dtype=torch.float32) < float(mask_spatial_prob)
+    none = ~(use_time | use_spat)
+    use_time[none] = True
+
+    if bool(use_time.any()):
+        tmask = sample_time_mask_style3_same_shape_cpu(
+            B=B,
+            C=C,
+            P=P_t,
+            ratio_min=float(time_ratio_range[0]),
+            ratio_max=float(time_ratio_range[1]),
+        )
+        target |= tmask & use_time[:, None, None]
+
+    if bool(use_spat.any()):
+        smask = sample_spatial_block_mask_same_shape_cpu(
+            coords=coords,
+            P_t=P_t,
+            ratio_min=float(spatial_ratio_range[0]),
+            ratio_max=float(spatial_ratio_range[1]),
+        )
+        target |= smask & use_spat[:, None, None]
+
+    if int(dilate_time) > 0:
+        target = dilate_time_mask(target, dilation=int(dilate_time))
+
+    return target
+
+@torch.no_grad()
 def physio_band_bin_masks(bin_centers_hz: torch.Tensor) -> Dict[str, torch.Tensor]:
     def m(lo, hi):
         return (bin_centers_hz >= lo) & (bin_centers_hz < hi)

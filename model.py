@@ -565,6 +565,7 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         rope_pos: torch.Tensor,   # (N,) or (B,N)
         dtype: torch.dtype,
         device: torch.device,
+        max_pos_hint: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         returns cos,sin indexed by positions:
@@ -574,7 +575,7 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         if self.rotary_dim == 0:
             raise RuntimeError("rotary_dim is 0 but _get_rope called")
 
-        max_pos = int(rope_pos.max().item()) + 1
+        max_pos = int(max_pos_hint) if max_pos_hint is not None else (int(rope_pos.max().item()) + 1)
 
         need_rebuild = True
         if self._rope_cache is not None:
@@ -610,7 +611,9 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         padding_mask: Optional[torch.Tensor],
         rope_pos: Optional[torch.Tensor] = None,
         attn_bias: Optional[torch.Tensor] = None,          # SDPA용 dense bias
-        spatial_qk_tok: Optional[torch.Tensor] = None,     # option 2용, 여기서는 아직 unused
+        spatial_q_add: Optional[torch.Tensor] = None,
+        spatial_k_add: Optional[torch.Tensor] = None,
+        rope_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
         x: (B, N, D)
@@ -631,7 +634,7 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         if self.rotary_dim > 0:
             if rope_pos is None:
                 raise ValueError("rope_pos must be provided when rotary_dim > 0")
-            cos, sin = self._get_rope(rope_pos, dtype=q.dtype, device=q.device)  # (N,half) or (B,N,half)
+            cos, sin = self._get_rope(rope_pos, dtype=q.dtype, device=q.device, max_pos_hint=rope_seq_len)  # (N,half) or (B,N,half)
             q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
             k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
             q_rot = apply_rope(q_rot, cos, sin)
@@ -639,10 +642,15 @@ class MultiheadSelfAttentionRoPE(nn.Module):
             q = torch.cat([q_rot, q_pass], dim=-1)
             k = torch.cat([k_rot, k_pass], dim=-1)
 
-        if (self.spatial_q_proj is not None) and (spatial_qk_tok is not None):
-            q_sp = self.spatial_q_proj(spatial_qk_tok)  # (B,N,D)
-            k_sp = self.spatial_k_proj(spatial_qk_tok)  # (B,N,D)
-
+        if (spatial_q_add is not None) or (spatial_k_add is not None):
+            if (spatial_q_add is None) or (spatial_k_add is None):
+                raise ValueError("spatial_q_add and spatial_k_add must be provided together")
+            q_sp = spatial_q_add
+            k_sp = spatial_k_add
+            if q_sp.shape != x.shape or k_sp.shape != x.shape:
+                raise ValueError(
+                    f"preprojected spatial q/k must have shape {x.shape}, got {q_sp.shape} and {k_sp.shape}"
+                )
             q_sp = q_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
             k_sp = k_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
 
@@ -686,7 +694,8 @@ class MultiheadSelfAttentionRoPE(nn.Module):
                 attn_mask = attn_bias
             else:
                 raise ValueError(f"attn_bias must have dim 3 or 4, got {attn_bias.shape}")
-            attn_mask = attn_mask.to(dtype=q.dtype)
+            if attn_mask.dtype != q.dtype:
+                attn_mask = attn_mask.to(dtype=q.dtype)
             if padding_mask is not None:
                 attn_mask = attn_mask.masked_fill(padding_mask[:, None, None, :], float("-inf"))
 
@@ -736,12 +745,18 @@ class CrossAttentionRoPE(nn.Module):
 
         self._rope_cache = None  # (cos, sin, max_pos, dtype, device)
 
-    def _get_rope(self, rope_pos: torch.Tensor, dtype: torch.dtype, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_rope(
+        self,
+        rope_pos: torch.Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_pos_hint: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # shared logic with self-attn; keep minimal
         if self.rotary_dim == 0:
             raise RuntimeError("rotary_dim is 0 but _get_rope called")
 
-        max_pos = int(rope_pos.max().item()) + 1
+        max_pos = int(max_pos_hint) if max_pos_hint is not None else (int(rope_pos.max().item()) + 1)
 
         need_rebuild = True
         if self._rope_cache is not None:
@@ -787,8 +802,8 @@ class CrossAttentionRoPE(nn.Module):
         v = v.view(B, Lk, self.n_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_dim > 0:
-            cos_q, sin_q = self._get_rope(rope_pos_q, dtype=q.dtype, device=q.device)
-            cos_k, sin_k = self._get_rope(rope_pos_k, dtype=q.dtype, device=q.device)
+            cos_q, sin_q = self._get_rope(rope_pos_q, dtype=q.dtype, device=q.device, max_pos_hint=Lq)
+            cos_k, sin_k = self._get_rope(rope_pos_k, dtype=q.dtype, device=q.device, max_pos_hint=Lk)
 
             q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
             k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
@@ -955,6 +970,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
+
 # ============================================================
 # Hybrid encoder blocks: divided spatiotemporal attention + occasional full attention
 # ============================================================
@@ -968,6 +984,7 @@ class FullAttentionBlock(nn.Module):
     def __init__(self, cfg: EEGModelConfig):
         super().__init__()
         self.use_spatial_bias = bool(getattr(cfg, "full_attn_use_spatial_bias", True))
+
         self.norm1 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
         self.attn = MultiheadSelfAttentionRoPE(
             d_model=cfg.d_model,
@@ -993,29 +1010,44 @@ class FullAttentionBlock(nn.Module):
             self.ls1 = None
             self.ls2 = None
 
-    def forward(self, x, padding_mask, rope_pos, chan_idx, spatial_bias_cc, spatial_qk_ch):
+    def forward(
+        self,
+        x,
+        padding_mask,
+        rope_pos,
+        chan_idx,
+        spatial_bias_cc,
+        spatial_qk_ch,
+        grid_channels: Optional[int] = None,
+        grid_patches: Optional[int] = None,
+    ):
         attn_bias = None
-        spatial_qk_tok = None
-        
-        if (spatial_qk_ch is not None) and (chan_idx is not None):
-            spatial_qk_tok = _gather_channel_features(spatial_qk_ch, chan_idx)
+        spatial_q_add = None
+        spatial_k_add = None
+
+        if (spatial_qk_ch is not None) and (chan_idx is not None) and (self.attn.spatial_q_proj is not None):
+            q_sp_ch = self.attn.spatial_q_proj(spatial_qk_ch)  # (B,C,D)
+            k_sp_ch = self.attn.spatial_k_proj(spatial_qk_ch)  # (B,C,D)
+            spatial_q_add = _gather_channel_features(q_sp_ch, chan_idx)
+            spatial_k_add = _gather_channel_features(k_sp_ch, chan_idx)
             if padding_mask is not None:
-                spatial_qk_tok = spatial_qk_tok.masked_fill(padding_mask[..., None], 0.0)
+                spatial_q_add = spatial_q_add.masked_fill(padding_mask[..., None], 0.0)
+                spatial_k_add = spatial_k_add.masked_fill(padding_mask[..., None], 0.0)
 
         if self.use_spatial_bias and (spatial_bias_cc is not None) and (chan_idx is not None):
-            # 기존 dense token-token bias path 유지
             c = chan_idx
             B, N = c.shape
             b = torch.arange(B, device=c.device)[:, None, None]
-            bias_cc_local = spatial_bias_cc.to(dtype=x.dtype, device=x.device)
-            attn_bias = bias_cc_local[b, c[:, :, None], c[:, None, :]]  # (B,N,N)
+            attn_bias = spatial_bias_cc[b, c[:, :, None], c[:, None, :]]  # (B,N,N)
 
         y = self.attn(
             self.norm1(x),
             padding_mask=padding_mask,
             rope_pos=rope_pos,
             attn_bias=attn_bias,
-            spatial_qk_tok=spatial_qk_tok,
+            spatial_q_add=spatial_q_add,
+            spatial_k_add=spatial_k_add,
+            rope_seq_len=grid_patches,
         )
         if self.ls1 is not None:
             y = self.ls1(y)
@@ -1026,6 +1058,7 @@ class FullAttentionBlock(nn.Module):
             y = self.ls2(y)
         x = x + self.dropout(y)
         return x
+
 
 
 class DividedSpatiotemporalBlock(nn.Module):
@@ -1087,14 +1120,38 @@ class DividedSpatiotemporalBlock(nn.Module):
             self.ls_s = None
             self.ls_m = None
 
+        self._batch_rows_cache = {}
+        self._temporal_rope_cache = {}
+
     @staticmethod
+    def _device_key(device: torch.device):
+        return (device.type, -1 if device.index is None else int(device.index))
+
+    def _get_batch_rows(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        key = (self._device_key(device), int(batch_size))
+        rows = self._batch_rows_cache.get(key)
+        if rows is None:
+            rows = torch.arange(batch_size, device=device, dtype=torch.long)[:, None]
+            self._batch_rows_cache[key] = rows
+        return rows
+
+    def _get_temporal_rope(self, P: int, device: torch.device) -> torch.Tensor:
+        key = (self._device_key(device), int(P))
+        rope = self._temporal_rope_cache.get(key)
+        if rope is None:
+            rope = torch.arange(P, device=device, dtype=torch.long)
+            self._temporal_rope_cache[key] = rope
+        return rope
+
     def _scatter_to_grid(
+        self,
         x: torch.Tensor,            # (B,L,D)
         pad: torch.Tensor,          # (B,L) True=PAD
-        c: torch.Tensor,            # (B,L) channel indices (safe)
-        t: torch.Tensor,            # (B,L) time indices (safe)
+        c_idx: torch.Tensor,            # (B,L) channel indices (safe)
+        t_idx: torch.Tensor,            # (B,L) time indices (safe)
         C: int,
         P: int,
+        b_rows: torch.Tensor,       # (B,1)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatter packed tokens to a dense (B,C,P,D) grid.
 
@@ -1109,109 +1166,101 @@ class DividedSpatiotemporalBlock(nn.Module):
         grid_pad = torch.ones((B, C, P), dtype=torch.bool, device=device)
 
         valid = ~pad
-        if valid.any():
-            b_idx = torch.arange(B, device=device)[:, None].expand(B, L)
-            b = b_idx[valid]
-            cc = c[valid]
-            tt = t[valid]
-            grid[b, cc, tt] = x[valid]
-            grid_pad[b, cc, tt] = False
+        b = b_rows.expand(B, L)[valid]
+        cc = c_idx[valid]
+        tt = t_idx[valid]
+        xv = x[valid]
 
+        grid[b, cc, tt] = xv
+        grid_pad[b, cc, tt] = False
         return grid, grid_pad
 
-    @staticmethod
     def _gather_from_grid(
+        self,
         grid: torch.Tensor,         # (B,C,P,D)
         pad: torch.Tensor,          # (B,L)
         c: torch.Tensor,            # (B,L)
         t: torch.Tensor,            # (B,L)
+        b_rows: torch.Tensor,       # (B,1)
     ) -> torch.Tensor:
         B, L = c.shape
-        device = c.device
-        b_idx = torch.arange(B, device=device)[:, None].expand(B, L)
-        out = grid[b_idx, c, t]
+        out = grid[b_rows.expand(B, L), c, t]
         return out.masked_fill(pad[..., None], 0.0)
 
-    def _temporal_pass(
+    @staticmethod
+    def _mask_grid_output(x: torch.Tensor, grid_pad: torch.Tensor) -> torch.Tensor:
+        return x.masked_fill(grid_pad[..., None], 0.0)
+
+    def _temporal_from_grid(
         self,
-        x: torch.Tensor,            # (B,L,D)
-        pad: torch.Tensor,          # (B,L)
-        t_idx: torch.Tensor,        # (B,L)
-        c_idx: torch.Tensor,        # (B,L)
-        C: int,
+        grid: torch.Tensor,         # (B,C,P,D)
+        grid_pad: torch.Tensor,     # (B,C,P)
         P: int,
     ) -> torch.Tensor:
-        # dense grid
-        grid, grid_pad = self._scatter_to_grid(x, pad, c_idx, t_idx, C=C, P=P)
+        B, C, P2, D = grid.shape
+        assert P2 == P
+        x_t = grid.reshape(B * C, P, D)
+        pad_t = grid_pad.reshape(B * C, P)
 
-        # temporal: (B*C, P, D)
-        x_t = grid.reshape(-1, P, grid.shape[-1])
-        pad_t = grid_pad.reshape(-1, P)
-        nonempty = (~pad_t).any(dim=1)
-        if nonempty.any():
-            x_sel = x_t[nonempty]
-            pad_sel = pad_t[nonempty]
-            rope = torch.arange(P, device=x.device, dtype=torch.long)
-            y_sel = self.attn_t(x_sel, padding_mask=pad_sel, rope_pos=rope, attn_bias=None)
-            y_t = x_t.new_zeros(x_t.shape, dtype=y_sel.dtype)
-            y_t[nonempty] = y_sel
-        else:
-            y_t = x_t.new_zeros(x_t.shape, dtype=x_t.dtype)
+        all_pad = pad_t.all(dim=1)
+        pad_t_safe = pad_t.clone()
+        pad_t_safe[:, 0] = pad_t_safe[:, 0] & (~all_pad)
 
-        grid_out = y_t.reshape(grid.shape)
-        return self._gather_from_grid(grid_out, pad, c_idx, t_idx)
+        rope = self._get_temporal_rope(P, grid.device)
+        y_t = self.attn_t(
+            x_t,
+            padding_mask=pad_t_safe,
+            rope_pos=rope,
+            attn_bias=None,
+            rope_seq_len=P,
+        )
+        y_t = y_t.masked_fill(all_pad[:, None, None], 0.0)
+        return y_t.reshape(B, C, P, D)
 
-    def _spatial_pass(
+    def _spatial_from_grid(
         self,
-        x: torch.Tensor,            # (B,L,D)
-        pad: torch.Tensor,          # (B,L)
-        t_idx: torch.Tensor,        # (B,L)
-        c_idx: torch.Tensor,        # (B,L)
-        spatial_bias_cc: Optional[torch.Tensor],  # (B,C,C)
-        spatial_qk_ch: Optional[torch.Tensor],
-        C: int,
+        grid: torch.Tensor,                     # (B,C,P,D)
+        grid_pad: torch.Tensor,                 # (B,C,P)
+        spatial_bias_cc: Optional[torch.Tensor],
+        spatial_qk_ch: Optional[torch.Tensor],  # (B,C,F)
         P: int,
     ) -> torch.Tensor:
-        # dense grid
-        grid, grid_pad = self._scatter_to_grid(x, pad, c_idx, t_idx, C=C, P=P)
+        B, C, P2, D = grid.shape
+        assert P2 == P
 
-        # spatial: group by time -> (B*P, C, D)
-        grid_tp = grid.permute(0, 2, 1, 3).contiguous()  # (B,P,C,D)
-        pad_tp = grid_pad.permute(0, 2, 1).contiguous()  # (B,P,C)
-        x_s = grid_tp.reshape(-1, C, grid.shape[-1])
-        pad_s = pad_tp.reshape(-1, C)
-        nonempty = (~pad_s).any(dim=1)
+        grid_tp = grid.permute(0, 2, 1, 3).contiguous()   # (B,P,C,D)
+        pad_tp = grid_pad.permute(0, 2, 1).contiguous()   # (B,P,C)
+        x_s = grid_tp.reshape(B * P, C, D)
+        pad_s = pad_tp.reshape(B * P, C)
 
-        if nonempty.any():
-            x_sel = x_s[nonempty]
-            pad_sel = pad_s[nonempty]
+        all_pad = pad_s.all(dim=1)
+        pad_s_safe = pad_s.clone()
+        pad_s_safe[:, 0] = pad_s_safe[:, 0] & (~all_pad)
 
-            group_idx = torch.nonzero(nonempty, as_tuple=False).squeeze(-1)
-            b_idx = group_idx // P
-
-            spatial_qk_sel = None
-            if spatial_qk_ch is not None:
-                spatial_qk_sel = spatial_qk_ch.to(dtype=x.dtype, device=x.device)[b_idx]  # (n_sel,C,F)
-
-            bias_sel = None
-            if spatial_bias_cc is not None:
-                bias_sel = spatial_bias_cc.to(dtype=x.dtype, device=x.device)[b_idx]  # (n_sel,C,C)
-
-            y_sel = self.attn_s(
-                x_sel,
-                padding_mask=pad_sel,
-                rope_pos=None,
-                attn_bias=bias_sel,
-                spatial_qk_tok=spatial_qk_sel,
-            )
-            y_s = x_s.new_zeros(x_s.shape, dtype=y_sel.dtype)
-            y_s[nonempty] = y_sel
+        bias = None
+        spatial_q_add = None
+        spatial_k_add = None
+        if spatial_bias_cc is not None:
+            bias = spatial_bias_cc[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, C)
         else:
-            y_s = x_s.new_zeros(x_s.shape, dtype=x_s.dtype)
+            if (spatial_qk_ch is not None) and (self.attn_s.spatial_q_proj is not None):
+                q_sp_ch = self.attn_s.spatial_q_proj(spatial_qk_ch)   # (B,C,D)
+                k_sp_ch = self.attn_s.spatial_k_proj(spatial_qk_ch)   # (B,C,D)
+                spatial_q_add = q_sp_ch[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, D)
+                spatial_k_add = k_sp_ch[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, D)
 
-        grid_tp_out = y_s.reshape(grid_tp.shape)  # (B,P,C,D)
-        grid_out = grid_tp_out.permute(0, 2, 1, 3).contiguous()  # (B,C,P,D)
-        return self._gather_from_grid(grid_out, pad, c_idx, t_idx)
+        y_s = self.attn_s(
+            x_s,
+            padding_mask=pad_s_safe,
+            rope_pos=None,
+            attn_bias=bias,
+            spatial_q_add=spatial_q_add,
+            spatial_k_add=spatial_k_add,
+        )
+        y_s = y_s.masked_fill(all_pad[:, None, None], 0.0)
+
+        grid_tp_out = y_s.reshape(B, P, C, D)
+        return grid_tp_out.permute(0, 2, 1, 3).contiguous()
 
     def forward(
         self,
@@ -1221,38 +1270,63 @@ class DividedSpatiotemporalBlock(nn.Module):
         chan_idx: Optional[torch.Tensor],
         spatial_bias_cc: Optional[torch.Tensor],
         spatial_qk_ch: Optional[torch.Tensor],
+        grid_channels: Optional[int] = None,
+        grid_patches: Optional[int] = None,
     ) -> torch.Tensor:
         if padding_mask is None:
-            # assume all valid
             padding_mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)
         if chan_idx is None:
             raise ValueError("DividedSpatiotemporalBlock requires chan_idx")
 
-        # infer grid sizes
-        if spatial_bias_cc is not None:
+        b_rows = self._get_batch_rows(int(x.shape[0]), x.device)
+
+        if grid_channels is not None:
+            C = int(grid_channels)
+        elif spatial_bias_cc is not None:
             C = int(spatial_bias_cc.shape[1])
+        elif spatial_qk_ch is not None:
+            C = int(spatial_qk_ch.shape[1])
         else:
             C = int(chan_idx.max().item()) + 1
-        P = int(rope_pos.max().item()) + 1
 
-        # temporal pass
-        y = self._temporal_pass(self.norm_t(x), padding_mask, rope_pos, chan_idx, C=C, P=P)
+        if grid_patches is not None:
+            P = int(grid_patches)
+        else:
+            P = int(rope_pos.max().item()) + 1
+
+        grid, grid_pad = self._scatter_to_grid(x, padding_mask, chan_idx, rope_pos, C=C, P=P, b_rows=b_rows)
+
+        # temporal
+        grid_t_in = self._mask_grid_output(self.norm_t(grid), grid_pad)
+        y_t = self._temporal_from_grid(grid_t_in, grid_pad, P=P)
         if self.ls_t is not None:
-            y = self.ls_t(y)
-        x = x + self.dropout(y)
+            y_t = self.ls_t(y_t)
+        y_t = self._mask_grid_output(self.dropout(y_t), grid_pad)
+        grid = grid + y_t
 
-        # spatial pass
-        y = self._spatial_pass(self.norm_s(x), padding_mask, rope_pos, chan_idx, spatial_bias_cc=spatial_bias_cc, spatial_qk_ch=spatial_qk_ch, C=C, P=P)
+        # spatial
+        grid_s_in = self._mask_grid_output(self.norm_s(grid), grid_pad)
+        y_s = self._spatial_from_grid(
+            grid_s_in,
+            grid_pad,
+            spatial_bias_cc=spatial_bias_cc,
+            spatial_qk_ch=spatial_qk_ch,
+            P=P,
+        )
         if self.ls_s is not None:
-            y = self.ls_s(y)
-        x = x + self.dropout(y)
+            y_s = self.ls_s(y_s)
+        y_s = self._mask_grid_output(self.dropout(y_s), grid_pad)
+        grid = grid + y_s
 
-        # MLP
-        y = self.mlp(self.norm_m(x))
+        # mlp
+        grid_m_in = self._mask_grid_output(self.norm_m(grid), grid_pad)
+        y_m = self.mlp(grid_m_in)
         if self.ls_m is not None:
-            y = self.ls_m(y)
-        x = x + self.dropout(y)
-        return x
+            y_m = self.ls_m(y_m)
+        y_m = self._mask_grid_output(self.dropout(y_m), grid_pad)
+        grid = grid + y_m
+
+        return self._gather_from_grid(grid, padding_mask, chan_idx, rope_pos, b_rows=b_rows)
 
 
 class EEGEncoder(nn.Module):
@@ -1345,13 +1419,16 @@ class EEGEncoder(nn.Module):
         idx = c_idx[..., None].expand(B, L, D)
         return x.gather(dim=1, index=idx)
 
+
     def embed_from_indices(
         self,
         x: torch.Tensor,             # (B,C,T)
-        coords: torch.Tensor,         # (B,C,3)
-        c_idx: torch.Tensor,          # (B,L) long, channel index (>=0 for valid)
-        t_idx: torch.Tensor,          # (B,L) long, patch-time index (>=0 for valid)
-        pad: torch.Tensor,            # (B,L) bool True=PAD
+        coords: torch.Tensor,        # (B,C,3)
+        c_idx: torch.Tensor,         # (B,L) long, channel index (>=0 for valid)
+        t_idx: torch.Tensor,         # (B,L) long, patch-time index (>=0 for valid)
+        pad: torch.Tensor,           # (B,L) bool True=PAD
+        # optional precomputed channel coord embeddings
+        coord_ch: Optional[torch.Tensor] = None,         # (B,C,D)
         # freq corruption (student context only)
         freq_mask_bins: Optional[torch.Tensor] = None,   # (B,K) bool True=mask
         freq_domain_drop: Optional[torch.Tensor] = None, # (B,) bool
@@ -1377,7 +1454,8 @@ class EEGEncoder(nn.Module):
         t_safe = t_idx.clamp(min=0)
 
         # coord embeddings per channel -> gather by c_idx
-        coord_ch = self.coord_embed(coords)  # (B,C,D)
+        if coord_ch is None:
+            coord_ch = self.coord_embed(coords)  # (B,C,D)
         coord_tok = self._safe_gather_channel(coord_ch, c_safe)  # (B,L,D)
         coord_tok = coord_tok.masked_fill(pad[..., None], 0.0)
 
@@ -1399,14 +1477,17 @@ class EEGEncoder(nn.Module):
             # apply freq corruption (only intended for student)
             if freq_domain_drop is not None:
                 # drop all freq dims (including scale) for dropped samples
-                drop = freq_domain_drop.to(device=device, dtype=torch.bool)[:, None]  # (B,1)
+                if freq_domain_drop.device != device or freq_domain_drop.dtype != torch.bool:
+                    freq_domain_drop = freq_domain_drop.to(device=device, dtype=torch.bool)
+                drop = freq_domain_drop[:, None]  # (B,1)
                 f = f.masked_fill(drop[..., None] & (~pad)[..., None], 0.0)
 
             if freq_mask_bins is not None:
                 # only mask the first K bins; keep optional scale dim intact
                 K = self.cfg.freq_bins
-                band = freq_mask_bins.to(device=device, dtype=torch.bool)  # (B,K)
-                band = band[:, None, :]  # (B,1,K)
+                if freq_mask_bins.device != device or freq_mask_bins.dtype != torch.bool:
+                    freq_mask_bins = freq_mask_bins.to(device=device, dtype=torch.bool)
+                band = freq_mask_bins[:, None, :]  # (B,1,K)
                 f_shape = f[..., :K].masked_fill(band & (~pad[..., None]), 0.0)
                 if f.shape[-1] > K:
                     f = torch.cat([f_shape, f[..., K:]], dim=-1)
@@ -1430,19 +1511,29 @@ class EEGEncoder(nn.Module):
         rope_pos: torch.Tensor,
         chan_idx: torch.Tensor,
         coords: Optional[torch.Tensor] = None,
+        grid_patches: Optional[int] = None,
     ) -> torch.Tensor:
-        # Precompute spatial bias once per forward (B,C,C). This avoids recomputing
-        # the Legendre series in every encoder block.
+        # Precompute spatial bias / spatial QK features once per forward.
         spatial_bias_cc = None
+        spatial_qk_ch = None
+        grid_channels = None
+
         if coords is not None:
+            grid_channels = int(coords.shape[1])
+
             spatial_bias_cc = self.spatial_bias(coords)
-            if spatial_bias_cc is not None:
+            if spatial_bias_cc is not None and (
+                spatial_bias_cc.device != tokens.device or spatial_bias_cc.dtype != tokens.dtype
+            ):
                 spatial_bias_cc = spatial_bias_cc.to(dtype=tokens.dtype, device=tokens.device)
 
-        spatial_qk_ch = None
-        if (coords is not None) and (self.spatial_qk_feat is not None):
-            spatial_qk_ch = self.spatial_qk_feat(coords)
-            spatial_qk_ch = spatial_qk_ch.to(dtype=tokens.dtype, device=tokens.device)
+            if self.spatial_qk_feat is not None:
+                spatial_qk_ch = self.spatial_qk_feat(coords)
+                if spatial_qk_ch.device != tokens.device or spatial_qk_ch.dtype != tokens.dtype:
+                    spatial_qk_ch = spatial_qk_ch.to(dtype=tokens.dtype, device=tokens.device)
+
+        if grid_patches is None and rope_pos.numel() > 0:
+            grid_patches = int(rope_pos.max().item()) + 1
 
         x = tokens
         for blk in self.blocks:
@@ -1453,6 +1544,8 @@ class EEGEncoder(nn.Module):
                 chan_idx=chan_idx,
                 spatial_bias_cc=spatial_bias_cc,
                 spatial_qk_ch=spatial_qk_ch,
+                grid_channels=grid_channels,
+                grid_patches=grid_patches,
             )
         x = self.norm(x)
         return x

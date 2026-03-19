@@ -13,6 +13,7 @@ import shutil
 import torch
 
 from contextlib import contextmanager
+from .masking import sample_jepa_target_mask_same_shape_style3_cpu
 from torch.utils.data import IterableDataset
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -24,7 +25,6 @@ except Exception:
 
 EEG_KEY = "eeg.npy"
 COORD_KEY = "coords.npy"
-META_KEY = "meta.json"
 
 @contextmanager
 def _file_lock(lock_path: str):
@@ -84,21 +84,6 @@ def _as_torch(x: Any) -> torch.Tensor:
 def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     eeg = sample[EEG_KEY]
     coord = sample[COORD_KEY]
-    meta = sample.get(META_KEY, {})
-    if isinstance(meta, (bytes, bytearray)):
-        meta = json.loads(meta.decode("utf-8"))
-
-    # Preserve webdataset identifiers for traceability / multi-view pairing.
-    # These keys are provided by webdataset tarfile_to_samples.
-    if not isinstance(meta, dict):
-        meta = {"meta": meta}
-    else:
-        # copy to avoid accidental shared-mutation across pipeline stages
-        meta = dict(meta)
-    if "__key__" in sample:
-        meta["__key__"] = sample.get("__key__")
-    if "__url__" in sample:
-        meta["__url__"] = sample.get("__url__")
 
     eeg = _as_torch(eeg).to(torch.float16)     # stored float16
     coord = _as_torch(coord).to(torch.float32)
@@ -106,7 +91,7 @@ def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     # coord = coord - coord.mean(dim=0, keepdim=True)
     # coord = coord / (coord.norm(dim=-1).mean().clamp_min(1e-6))
 
-    return {"eeg": eeg, "coord": coord, "meta": meta}
+    return {"eeg": eeg, "coord": coord}
 
 def _flatmap_stage(mapper):
     """Compatibility replacement for `webdataset.flatmap` (not present in some versions).
@@ -149,8 +134,7 @@ def _split_one_view_to_fit(
     prefer_chunk_sec=(30, 10),
 ):
     eeg = ex["eeg"]
-    meta = ex.get("meta", {})
-    fs = int(meta.get("fs", 200)) or 200
+    fs = 200
 
     C, T = eeg.shape
     P = compute_num_patches(T, patch_samples=patch_samples, hop_samples=hop_samples)
@@ -177,7 +161,6 @@ def _split_one_view_to_fit(
 
     outs = []
     n_chunks = math.ceil(P / chunk_P)
-    parent_uid = str(meta.get("__key__", "")) or str(meta.get("__url__", ""))
 
     for i in range(n_chunks):
         p0 = i * chunk_P
@@ -187,14 +170,6 @@ def _split_one_view_to_fit(
 
         out = dict(ex)
         out["eeg"] = eeg[:, start:start + T_need].contiguous()
-
-        meta2 = dict(meta)
-        meta2["parent_uid"] = parent_uid
-        meta2["token_fit_split"] = True
-        meta2["token_fit_split_idx"] = i
-        meta2["token_fit_split_of"] = n_chunks
-        meta2["view_type"] = "local" if n_chunks > 1 else meta2.get("view_type", "global")
-        out["meta"] = meta2
 
         outs.append(_annotate_tokens(out, patch_samples, hop_samples))
 
@@ -210,12 +185,10 @@ def split_long_and_fit(
     hop_samples: int,
 ):
     eeg = ex["eeg"]
-    meta = ex.get("meta", {})
-    fs = int(meta.get("fs", 200)) or 200
+    fs = 200
 
     C, T = eeg.shape
     duration_sec = int(T // fs)
-    parent_uid = str(meta.get("__key__", "")) or str(meta.get("__url__", ""))
 
     # 1) long-crop policy: replace with non-overlapping views, but keep all information
     base_views = [(0, T, False, "global")]   # (start, length, multicrop, view_type)
@@ -237,15 +210,6 @@ def split_long_and_fit(
         out = dict(ex)
         out["eeg"] = eeg[:, s:s + curT].contiguous()
 
-        meta2 = dict(meta)
-        meta2["parent_uid"] = parent_uid
-        meta2["multicrop"] = multicrop
-        meta2["view_type"] = view_type
-        meta2["long_view_idx"] = j
-        meta2["long_view_of"] = len(base_views)
-        meta2["duration_sec"] = int(curT // fs)
-        out["meta"] = meta2
-
         outs.extend(
             _split_one_view_to_fit(
                 out,
@@ -258,7 +222,13 @@ def split_long_and_fit(
 
     return outs
 
-def collate_stack(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: int) -> Dict[str, Any]:
+def collate_stack(
+    batch: List[Dict[str, Any]],
+    patch_samples: int,
+    hop_samples: int,
+    emit_target_mask: bool = False,
+    target_mask_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
     """
     (C,P) 동일 shape 배치 전용 collate. padding 없이 stack.
     - batch 내 모든 샘플의 n_channels, n_patches가 동일해야 함.
@@ -278,15 +248,28 @@ def collate_stack(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: 
     n_channels = torch.full((B,), C, dtype=torch.long)
     n_patches = torch.full((B,), P, dtype=torch.long)
 
-    meta = [b.get("meta", {}) for b in batch]
-
-    return {
+    out = {
         "eeg": eeg,
         "coord": coord,
         "n_channels": n_channels,
         "n_patches": n_patches,
-        "meta": meta,
     }
+
+    if emit_target_mask:
+        assert target_mask_cfg is not None, "target_mask_cfg is required when emit_target_mask=True"
+        assert int(target_mask_cfg["time_mask_style"]) == 3, "worker fast path is style-3 only"
+
+        out["target_mask"] = sample_jepa_target_mask_same_shape_style3_cpu(
+            coords=coord,
+            P_t=P,
+            mask_time_prob=float(target_mask_cfg["mask_time_prob"]),
+            mask_spatial_prob=float(target_mask_cfg["mask_spatial_prob"]),
+            time_ratio_range=tuple(target_mask_cfg["time_ratio_range"]),
+            spatial_ratio_range=tuple(target_mask_cfg["spatial_ratio_range"]),
+            dilate_time=int(target_mask_cfg.get("mask_dilate_time", 0)),
+        )
+
+    return out
 
 
 class LRUShardCache:
@@ -443,6 +426,9 @@ class ShapeBatcher(IterableDataset):
         # 기타
         shuffle_within_bucket: bool = True,
         yield_incomplete: bool = True,    # False면 flush 시 버림(drop)
+        # masking
+        emit_target_mask: bool = False,
+        target_mask_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.dataset = dataset
         self.tokens_per_batch = int(tokens_per_batch)
@@ -457,6 +443,9 @@ class ShapeBatcher(IterableDataset):
 
         self.shuffle_within_bucket = bool(shuffle_within_bucket)
         self.yield_incomplete = bool(yield_incomplete)
+
+        self.emit_target_mask = bool(emit_target_mask)
+        self.target_mask_cfg = target_mask_cfg
 
         assert self.tokens_per_batch > 0
         assert self.max_samples_per_batch > 0
@@ -490,8 +479,14 @@ class ShapeBatcher(IterableDataset):
             pending_tokens -= sum(int(x.get("n_tokens", 0)) for x in buf)
 
             if self.yield_incomplete:
-                yield collate_stack(buf, patch_samples=self.patch_samples, hop_samples=self.hop_samples)
-            # else: drop
+                yield collate_stack(
+                    batch,
+                    patch_samples=self.patch_samples,
+                    hop_samples=self.hop_samples,
+                    emit_target_mask=self.emit_target_mask,
+                    target_mask_cfg=self.target_mask_cfg,
+                )
+    
 
         def _flush_oldest_until_under_limits():
             nonlocal pending_samples, pending_tokens
@@ -550,8 +545,13 @@ class ShapeBatcher(IterableDataset):
                 pending_samples -= bs_target
                 pending_tokens -= sum(int(x.get("n_tokens", C * P)) for x in batch)
 
-                yield collate_stack(batch, patch_samples=self.patch_samples, hop_samples=self.hop_samples)
-
+                yield collate_stack(
+                    batch,
+                    patch_samples=self.patch_samples,
+                    hop_samples=self.hop_samples,
+                    emit_target_mask=self.emit_target_mask,
+                    target_mask_cfg=self.target_mask_cfg,
+                ) 
                 # 남은 게 있으면 wait 타이머 리셋(남은 샘플들이 바로 flush되지 않게)
                 if len(buf) > 0:
                     first_seen[key] = seen
@@ -586,7 +586,6 @@ def build_webdataset(
     max_tokens: int,
     patch_samples: int,
     hop_samples: int,
-    enable_channel_grouping: bool,
     limit_num_samples: int = 0,
     cache_max_bytes: int = 0, # ex: 500GB -> 500*1024**3
     post_split_shuffle: int = 256,

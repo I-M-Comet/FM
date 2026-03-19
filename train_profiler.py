@@ -1,4 +1,5 @@
 # eeg_fm/train.py
+# https://ui.perfetto.dev/
 from __future__ import annotations
 
 import argparse
@@ -20,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
+from torch.profiler import record_function, profile, ProfilerActivity
 
 from .config import EEGModelConfig, TrainConfig
 from .model import EEGEncoder, CrossAttentionPredictor, Z_Projector, LayerSpecAlignHeads
@@ -36,7 +38,13 @@ try:
     from accelerate.utils import set_seed
 except Exception:
     Accelerator = None
-
+"""
+CUDA_VISIBLE_DEVICES=1 python -m eeg_fm.train_2 \
+--model_cfg eeg_fm/configs/A4/model.json \
+--train_cfg eeg_fm/configs/A4/train.json \
+--output_dir /mnt/e/checkpoints/test \
+--no_wandb
+"""
 @torch.no_grad()
 def compute_logspec_view(
     patches: torch.Tensor,   # (N, S) float32
@@ -1265,623 +1273,668 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         vic_w_sum = torch.zeros((), device=dev, dtype=torch.float32)
     
     start_time = time.time()
-    while global_step < train_cfg.max_steps:
-        try:
-            batch = next(it)
-            batches_seen_in_pass += 1
-        except StopIteration:
-            passes_completed += 1
+    n_wait, n_warm, n_act = 10,2,5
+    print_pinned = True
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=n_wait, warmup=n_warm, active=n_act, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False
+    ) as prof:
+        while global_step < train_cfg.max_steps:
+            try:
+                with record_function("batch.fetch"):
+                    batch = next(it)
+                if print_pinned:
+                    print(batch["eeg"].is_pinned(), batch["coord"].is_pinned(),
+                        batch["n_channels"].is_pinned(), batch["n_patches"].is_pinned())
+                    print_pinned = False
+                batches_seen_in_pass += 1
+            except StopIteration:
+                passes_completed += 1
 
-            if accelerator.is_main_process:
-                pbar.write(f"[data] pass {passes_completed} completed. Step: {global_step}")
-                pbar.write(
-                    f"Input Tokens: {pass_input_tokens}, "
-                    f"Target Tokens: {pass_target_tokens}, "
-                    f"Context Tokens: {pass_context_tokens}"
-                )
-                pbar.write(
-                    f"Effective Target Tokens: {pass_eff_target_tokens}, "
-                    f"Step Equivalent Tokens: "
-                    f"{(pass_eff_target_tokens / max(1, budget_tokens)) if use_token_budget else 0.0:.2f}"
-                )
-
-            # reset current-pass counters on ALL ranks
-            pass_input_tokens = 0
-            pass_target_tokens = 0
-            pass_context_tokens = 0
-            pass_eff_target_tokens = 0
-            batches_seen_in_pass = 0
-
-            it = iter(loader)
-            batch = next(it)
-            batches_seen_in_pass = 1
-
-        x = batch["eeg"].to(dev, non_blocking=True)          # (B,C,T)
-        coords = batch["coord"].to(dev, non_blocking=True)   # (B,C,3)
-        n_channels = batch["n_channels"].to(dev, non_blocking=True)
-        n_patches = batch["n_patches"].to(dev, non_blocking=True)
-        target_mask = batch.get("target_mask", None)
-        if target_mask is not None:
-            target_mask = target_mask.to(dev, non_blocking=True)
-        B, C_max, _ = x.shape
-        # P_max = int(n_patches.max().item())
-        P_max = int(batch["n_patches"][0].item())
-        x = rescale_small_segments(x, target_rms=1.0, rms_low=0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
-
-        # valid token mask (B,C,P)
-        # chan_ok = (torch.arange(C_max, device=x.device)[None, :, None] < n_channels[:, None, None])
-        # time_ok = (torch.arange(P_max, device=x.device)[None, None, :] < n_patches[:, None, None])
-        # valid = chan_ok & time_ok  # (B,C,P)
-        valid = torch.ones((B, C_max, P_max), dtype=torch.bool, device=x.device)
-
-        # ---------------------------------
-        # 0) decide whether to sync gradients this micro-batch
-        # ---------------------------------
-        bucket_key = (int(x.shape[1]), int(P_max))
-
-        # We decide sync *after* we know token counts (needs mask),
-        # but to avoid duplicating logic, we default to no_sync context and
-        # override later.
-
-        # 1) JEPA target mask (B,C,P)
-        if target_mask is None:
-            target_mask = sample_jepa_target_mask(
-                coords=coords,
-                n_channels=n_channels,
-                n_patches=n_patches,
-                mask_time_prob=train_cfg.mask_time_prob,
-                mask_spatial_prob=train_cfg.mask_spatial_prob,
-                time_ratio_range=(train_cfg.time_mask_ratio_min, train_cfg.time_mask_ratio_max),
-                spatial_ratio_range=(train_cfg.spatial_mask_ratio_min, train_cfg.spatial_mask_ratio_max),
-                time_mask_style=train_cfg.time_mask_style,
-                time_mask_num_blocks=train_cfg.time_mask_num_blocks,
-                time_mask_min_block_patches=train_cfg.time_mask_min_block_patches,
-                time_ssp_keep_blocks=train_cfg.time_ssp_keep_blocks,
-                time_ssp_min_keep_patches=train_cfg.time_ssp_min_keep_patches,
-            )
-            if train_cfg.mask_dilate_time and train_cfg.mask_dilate_time > 0:
-                target_mask = dilate_time_mask(target_mask, dilation=int(train_cfg.mask_dilate_time))
-        else:
-            target_mask = target_mask.to(dtype=torch.bool)
-        target_mask = target_mask & valid
-        context_mask = (~target_mask) & valid
-
-        # token counts for token-budget accumulation
-        if manual_accum:
-            if use_token_budget:
-                if accum_basis == "valid":
-                    tokens_this = int(B) * int(x.shape[1]) * int(P_max)
-                elif accum_basis == "context":
-                    tokens_this = int(context_mask.sum().item())
-                else:  # default: "target"
-                    tokens_this = int(target_mask.sum().item())
-            else:
-                tokens_this = 1
-        else:
-            tokens_this = 0
-
-        if manual_accum:
-            if use_token_budget:
-                # always do at least 1 micro-batch per optimizer step
-                if accum_tokens == 0 and tokens_this <= 0:
-                    will_step = True
-                else:
-                    will_step = (accum_tokens + tokens_this) >= max(1, budget_tokens)
-            else:
-                will_step = (accum_micro + 1) >= max(1, budget_tokens)
-        else:
-            will_step = True
-
-        # DDP gradient sync control
-        no_sync = manual_accum and (not will_step) and (accelerator.num_processes > 1)
-
-        # effective tokens contributed by this micro-batch (used for token-based LR schedule + regularizers)
-        tokens_eff_this = int(tokens_this)
-        if manual_accum and use_token_budget and (budget_tokens > 0) and will_step:
-            remain = max(0, int(budget_tokens) - int(accum_tokens))
-            if remain > 0 and int(tokens_this) > remain:
-                tokens_eff_this = int(remain)
-
-        with ExitStack() as stack:
-            if no_sync:
-                # avoid all-reduce on non-final micro-batches
-                if hasattr(student, "no_sync"):
-                    stack.enter_context(student.no_sync())
-                if hasattr(predictor, "no_sync"):
-                    stack.enter_context(predictor.no_sync())
-
-            # 2) student augmentations (time alignment preserving)
-            x_aug = apply_student_augmentations(
-                x,
-                gain_min=train_cfg.aug_gain_min,
-                gain_max=train_cfg.aug_gain_max,
-                channel_gain_std=train_cfg.aug_channel_gain_std,
-                noise_std_min=train_cfg.aug_noise_std_min,
-                noise_std_max=train_cfg.aug_noise_std_max,
-                channel_drop_prob=train_cfg.aug_channel_drop_prob,
-            )
-
-            # 3) freq corruption (student context only)
-            if model_cfg.film_hidden > 0:
-                freq_domain_drop = (torch.rand((B,), device=x.device) < train_cfg.freq_domain_drop_prob)
-                freq_mask_bins = sample_freq_bin_mask(
-                    B=B,
-                    K=model_cfg.freq_bins,
-                    bin_centers_hz=bin_centers,
-                    physio_prob=train_cfg.freq_physio_mask_prob,
-                    num_bands_min=train_cfg.freq_num_bands_min,
-                    num_bands_max=train_cfg.freq_num_bands_max,
-                    random_width_min=train_cfg.freq_random_width_min,
-                    random_width_max=train_cfg.freq_random_width_max,
-                    device=x.device,
-                )
-            else:
-                freq_domain_drop = None
-                freq_mask_bins = None
-
-            # 4) pack indices
-            c_ctx, t_ctx, pad_ctx = mask_to_packed_indices(context_mask, valid)
-            c_tgt, t_tgt, pad_tgt = mask_to_packed_indices(target_mask, valid)
-
-            with accelerator.autocast():
-                # 5) student: embed+encode context only
-                coord_ch_student = student_raw.coord_embed(coords)  # (B,C,D)
-                tok_ctx, pad_ctx, rope_ctx, chan_ctx = student_raw.embed_from_indices(
-                    x=x_aug,
-                    coords=coords,
-                    c_idx=c_ctx,
-                    t_idx=t_ctx,
-                    pad=pad_ctx,
-                    coord_ch=coord_ch_student,
-                    freq_mask_bins=freq_mask_bins,
-                    freq_domain_drop=freq_domain_drop,
-                )
-                # NOTE: embed_from_indices is called on the unwrapped module to avoid DDP wrapper issues
-                # around the unfold/view path. The wrapped model still handles the main encoder forward.
-                z_ctx = student(tok_ctx, padding_mask=pad_ctx, rope_pos=rope_ctx, chan_idx=chan_ctx, coords=coords, grid_pathes=P_max)  # (B,Lc,D)
-
-                # 6) teacher: embed+encode targets only (no corruption)
-                with torch.no_grad():
-                    coord_ch_teacher = teacher_raw.coord_embed(coords)  # (B,C,D)
-                    tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher_raw.embed_from_indices(
-                        x=x,
-                        coords=coords,
-                        c_idx=c_tgt,
-                        t_idx=t_tgt,
-                        pad=pad_tgt,
-                        coord_ch=coord_ch_teacher,
-                        freq_mask_bins=None,
-                        freq_domain_drop=None,
-                    )
-                    z_tgt = teacher(tok_tgt, padding_mask=pad_tgt2, rope_pos=rope_tgt, chan_idx=chan_tgt, coords=coords)  # (B,Lt,D)
-
-                # 7) predictor: build target queries from coord embeddings + cross-attend to ctx
-                coord_tgt = gather_channel_embeddings(coord_ch_student, c_tgt.clamp(min=0), pad_tgt)   # (B,Lt,D)
-
-                if spec_align_heads is not None:
-                    pred_tgt, pred_hidden = predictor(
-                        ctx=z_ctx,
-                        ctx_pad=pad_ctx,
-                        rope_ctx=rope_ctx,
-                        tgt_coord_emb=coord_tgt,
-                        tgt_pad=pad_tgt,
-                        rope_tgt=rope_tgt,
-                        return_hidden=True,
-                    )  # (B,Lt,D), list of hidden states
-                else:
-                    pred_tgt = predictor(
-                        ctx=z_ctx,
-                        ctx_pad=pad_ctx,
-                        rope_ctx=rope_ctx,
-                        tgt_coord_emb=coord_tgt,
-                        tgt_pad=pad_tgt,
-                        rope_tgt=rope_tgt,
-                    )  # (B,Lt,D)
-                    pred_hidden = None
-
-                # 8) loss on non-pad targets
-                valid_tgt = ~pad_tgt
-                num_tgt_tensor = valid_tgt.sum().float().clamp_min(1.0)
-
-                # sum reduction for token-budget scaling
-                diff = torch.abs(pred_tgt - z_tgt)
-                diff = diff.masked_fill(pad_tgt[..., None], 0.0)
-                loss_sum = diff.sum().float()
-                # loss_sum = F.l1_loss(pred_tgt[valid_tgt], z_tgt[valid_tgt], reduction="sum").float()
-                
-                spec_align_loss = None
-                if spec_align_heads is not None:
-                    # target patches gather
-                    patches_view = student_raw.extract_patches_view(x)  # (B,C,P,S)
-                    c_safe = c_tgt.clamp(min=0)
-                    t_safe = t_tgt.clamp(min=0)
-                    B_, Lt = c_safe.shape
-                    b_idx = torch.arange(B_, device=x.device)[:, None].expand(B_, Lt)
-                    patches_tgt = patches_view[b_idx, c_safe, t_safe]   # (B,Lt,S)
-                    patches_flat = patches_tgt[valid_tgt].to(torch.float32)
-
-                    spec_target = compute_logspec_view(
-                        patches_flat,
-                        fs=model_cfg.sample_rate,
-                        f_min=model_cfg.freq_min_hz,
-                        f_max=model_cfg.freq_max_hz,
-                        per_patch_zscore=True,
-                    )  # (Nvalid, Fsel)
-
-                    spec_target = F.normalize(spec_target, dim=-1)
-
-                    # 어떤 layer들을 쓸지 선택
-                    layer_indices = getattr(train_cfg, "spec_align_layer_indices", None)
-                    if layer_indices is None or layer_indices == "all":
-                        use_layers = list(range(len(pred_hidden)))
-                    else:
-                        use_layers = layer_indices  # e.g. [-2, -1] or [0,1]
-
-                    layer_losses = []
-                    for li in use_layers:
-                        h = pred_hidden[li][valid_tgt]      # (Nvalid, D)
-                        h_proj = spec_align_heads.forward_one(h, li)  # (Nvalid, Fsel)
-                        h_proj = F.normalize(h_proj, dim=-1)
-                        layer_losses.append(1.0 - (h_proj * spec_target).sum(dim=-1).mean())
-
-                    spec_align_loss = torch.stack(layer_losses).mean()
-
-                    # warmup/ramp
-                    lam0 = float(getattr(train_cfg, "spec_align_weight", 0.0))
-                    warm = int(getattr(train_cfg, "spec_align_warmup_steps", 0))
-                    ramp = int(getattr(train_cfg, "spec_align_ramp_steps", 0))
-                    if global_step < warm:
-                        lam = 0.0
-                    elif ramp > 0:
-                        u = min(1.0, float(global_step - warm) / float(ramp))
-                        lam = lam0 * u
-                    else:
-                        lam = lam0
-
-                    loss_sum = loss_sum + lam * spec_align_loss
-
-                spec_rel_loss = None
-                if rel_z_projector is not None:
-                    # target patches -> fixed raw log-spectrum
-                    patches_view = student_raw.extract_patches_view(x)
-                    c_safe = c_tgt.clamp(min=0)
-                    t_safe = t_tgt.clamp(min=0)
-                    B_, Lt = c_safe.shape
-                    b_idx = torch.arange(B_, device=x.device)[:, None].expand(B_, Lt)
-                    patches_tgt = patches_view[b_idx, c_safe, t_safe]
-                    valid_tgt = ~pad_tgt
-
-                    patches_flat = patches_tgt[valid_tgt].to(torch.float32)
-                    spec_target = compute_logspec_view(
-                        patches_flat,
-                        fs=model_cfg.sample_rate,
-                        f_min=model_cfg.freq_min_hz,
-                        f_max=model_cfg.freq_max_hz,
-                        per_patch_zscore=True,
-                    )  # (Nvalid, Fsel)
-
-                    z_flat = pred_tgt[valid_tgt]  # (Nvalid, D)
-
-                    # O(N^2)라 subsample 필수
-                    M = int(getattr(train_cfg, "spec_rel_subsample_tokens", 512))
-                    Nvalid = z_flat.shape[0]
-                    if Nvalid > M:
-                        idx = torch.randperm(Nvalid, device=x.device)[:M]
-                        z_flat = z_flat[idx]
-                        spec_target = spec_target[idx]
-
-                    z_rel = rel_z_projector(z_flat)  # (M, Drel)
-
-                    spec_rel_loss = relational_kl_loss(
-                        z=z_rel,
-                        s=spec_target,  # dimension 달라도 관계행렬만 비교하므로 OK
-                        tau_z=float(getattr(train_cfg, "spec_rel_tau_z", 0.1)),
-                        tau_s=float(getattr(train_cfg, "spec_rel_tau_s", 0.1)),
-                    )
-
-                    lam0 = float(getattr(train_cfg, "spec_rel_weight", 0.0))
-                    warm = int(getattr(train_cfg, "spec_rel_warmup_steps", 0))
-                    ramp = int(getattr(train_cfg, "spec_rel_ramp_steps", 0))
-                    if global_step < warm:
-                        lam = 0.0
-                    elif ramp > 0:
-                        u = min(1.0, float(global_step - warm) / float(ramp))
-                        lam = lam0 * u
-                    else:
-                        lam = lam0
-
-                    loss_sum = loss_sum + lam * spec_rel_loss
-
-                # scale loss so that one optimizer step ~= (tokens_per_update) worth of supervision
-                weight = 1.0
-                if manual_accum:
-                    denom_tokens = max(1, budget_tokens)
-                    if use_token_budget:
-                        if accum_basis != "target":
-                            # If you set accum_basis != target, you're effectively optimizing "loss per (basis) token".
-                            # This is allowed, but note that supervision exists only on target tokens.
-                            pass
-                        # fractional weight for the last micro-batch to hit the token budget more tightly
-                        if will_step and denom_tokens > 0:
-                            remain = max(0, denom_tokens - int(accum_tokens))
-                            if tokens_this > 0 and remain > 0 and tokens_this > remain:
-                                weight = float(remain) / float(tokens_this)
-                            elif remain == 0:
-                                weight = 1.0
-                        loss_scaled = (loss_sum * float(weight)) / (float(denom_tokens) * float(model_cfg.d_model))
-                    else:
-                        # fixed micro-batch accumulation: average loss across micro-batches
-                        loss_scaled = (loss_sum / (num_tgt_tensor * model_cfg.d_model)) / denom_tokens
-                else:
-                    # single-step: standard mean loss
-                    loss_scaled = loss_sum / (num_tgt_tensor * model_cfg.d_model)
-
-                loss_log = loss_sum / (num_tgt_tensor * model_cfg.d_model)
-
-                # ------------------------------------------------------------
-                # (Optional) VICReg-style variance/cov regularizer
-                # ------------------------------------------------------------
-                vic_w = float(getattr(train_cfg, "vicreg_weight", 0.0) or 0.0)
-                vic_apply = str(getattr(train_cfg, "vicreg_apply_to", "pred")).lower().strip()
-                vic_gamma = float(getattr(train_cfg, "vicreg_gamma", 1.0) or 1.0)
-                vic_var_w = float(getattr(train_cfg, "vicreg_var_weight", 1.0) or 1.0)
-                vic_cov_w = float(getattr(train_cfg, "vicreg_cov_weight", 1.0) or 1.0)
-                vic_max = int(getattr(train_cfg, "vicreg_max_tokens", 0) or 0)
-
-                if vic_w > 0:
-                    if vic_apply == "ctx":
-                        valid_ctx_tmp = ~pad_ctx
-                        denom_c = valid_ctx_tmp.sum(dim=1).clamp_min(1).to(z_ctx.dtype)
-                        feats = (z_ctx * valid_ctx_tmp[..., None]).sum(dim=1) / denom_c[:, None]  # (B,D)
-                        feats = feats.float()
-                    else:
-                        feats = pred_tgt[valid_tgt].float()  # (Nt,D)
-
-                    if vic_max > 0 and feats.shape[0] > vic_max:
-                        idx = torch.randperm(feats.shape[0], device=feats.device)[:vic_max]
-                        feats = feats.index_select(0, idx)
-
-                    base, vvar, vcov = vicreg_var_cov_loss(feats, gamma=vic_gamma, var_weight=vic_var_w, cov_weight=vic_cov_w)
-                    vic_loss = vic_w * base
-
-                    # scale to be invariant to #micro-batches per optimizer update
-                    reg_scale = 1.0
-                    if manual_accum:
-                        if use_token_budget:
-                            reg_scale = float(tokens_eff_this) / float(max(1, budget_tokens))
-                        else:
-                            reg_scale = float(weight) / float(max(1, budget_tokens))
-
-                    loss_scaled = loss_scaled + vic_loss * float(reg_scale)
-
-                    if 'vic_log' in locals() and vic_log:
-                        vic_loss_sum += vic_loss.detach().float() * float(reg_scale)
-                        vic_var_sum += vvar.detach().float() * float(reg_scale)
-                        vic_cov_sum += vcov.detach().float() * float(reg_scale)
-                        vic_w_sum += float(reg_scale)
-
-                # ---------------------------------
-                # Cheap proxy stats (logged on optimizer step)
-                # ---------------------------------
-                if proxy_enabled:
-                    with torch.no_grad():
-                        pred_f = pred_tgt[valid_tgt].detach().float()
-                        tgt_f = z_tgt[valid_tgt].detach().float()
-
-                        # subsample tokens to keep this cheap
-                        max_proxy = int(getattr(train_cfg, "proxy_max_tokens", 0) or 0)
-                        if max_proxy > 0 and pred_f.shape[0] > max_proxy:
-                            idx = torch.linspace(0, pred_f.shape[0] - 1, steps=max_proxy, device=pred_f.device).long()
-                            pred_f = pred_f.index_select(0, idx)
-                            tgt_f = tgt_f.index_select(0, idx)
-
-                        w = float(weight)
-                        n_proxy = float(pred_f.shape[0])
-                        if n_proxy > 0:
-                            cos = F.cosine_similarity(pred_f, tgt_f, dim=-1)
-                            proxy_last_cos_mean = cos.mean()
-                            proxy_cos_sum += cos.sum() * w
-                            proxy_n += n_proxy * w
-
-                            pn = pred_f.norm(dim=-1)
-                            tn = tgt_f.norm(dim=-1)
-                            proxy_pred_norm_sum += pn.sum() * w
-                            proxy_pred_norm_sumsq += (pn ** 2).sum() * w
-                            proxy_tgt_norm_sum += tn.sum() * w
-                            proxy_tgt_norm_sumsq += (tn ** 2).sum() * w
-
-                            proxy_last_pred_feat_std = pred_f.std(unbiased=False)
-                            proxy_last_tgt_feat_std = tgt_f.std(unbiased=False)
-
-            accelerator.backward(loss_scaled)
-        
-        pass_input_tokens += valid.sum().detach()
-        pass_target_tokens += target_mask.sum().detach()
-        pass_context_tokens += context_mask.sum().detach()
-        pass_eff_target_tokens += int(tokens_eff_this)
-        # update accumulation stats
-        if manual_accum:
-            accum_tokens += int(tokens_this)
-            accum_tokens_eff += int(tokens_eff_this)
-            accum_micro += 1
-            accum_bucket_keys.add(bucket_key)
-
-        # ---------------------------------
-        # Optimizer step boundary
-        # ---------------------------------
-        do_step = bool(will_step)
-
-        if do_step:
-            grad_norm = None
-            if train_cfg.grad_clip and train_cfg.grad_clip > 0:
-                grad_norm = accelerator.clip_grad_norm_(list(student.parameters()) + list(predictor.parameters()), train_cfg.grad_clip)
-
-            # LR schedule
-            if lr_sched == "token_wcc":
-                total_toks = int(resolved_lr_total_tokens)
-                warm_toks = int(resolved_lr_warmup_tokens)
-                cool_toks = int(resolved_lr_cooldown_tokens)
-                min_lr = float(getattr(train_cfg, "min_lr", 0.0) or 0.0)
-                tokens_next = int(tokens_seen_total) + int(accum_tokens_eff)
-                lr = token_wcc_lr(tokens_next, warm_toks, total_toks, cool_toks, train_cfg.lr, min_lr)
-            else:
-                lr = cosine_warmup(global_step, train_cfg.warmup_steps, schedule_total_steps, train_cfg.lr)
-
-            for pg in opt.param_groups:
-                pg["lr"] = lr
-
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-
-            if lr_sched == "token_wcc":
-                tokens_seen_total = int(tokens_seen_total) + int(accum_tokens_eff)
-
-            m = ema_momentum_schedule(global_step, ema_total_steps, train_cfg.ema_momentum, train_cfg.ema_momentum_final)
-            update_ema(teacher=teacher_raw, student=student_raw, m=m)
-
-            if accelerator.is_main_process and (global_step % train_cfg.log_every == 0):
-                # bucket key (shape) for this micro-batch (ShapeBatcher guarantees same (C,P) inside micro-batch)
-                log_bucket = bool(getattr(train_cfg, "log_bucket_key", True))
-                if log_bucket:
-                    bucket_C = int(n_channels[0].detach().cpu().item())
-                    bucket_P = int(n_patches[0].detach().cpu().item())
-                    bucket_tok_per_sample = int(bucket_C * bucket_P)
-                else:
-                    bucket_C = 0
-                    bucket_P = 0
-                    bucket_tok_per_sample = 0
-
-                if spec_align_loss is not None:
-                    spec_loss = float(spec_align_loss.detach().cpu().item())
-                    spec_lam = float(lam)
-                elif spec_rel_loss is not None:
-                    spec_loss = float(spec_rel_loss.detach().cpu().item())
-                    spec_lam = float(lam)
-                else:
-                    spec_loss = 0.0
-                    spec_lam = 0.0
-
-                logs = {
-                    "loss_tgt_mean": float(loss_log.detach().cpu().item()),
-                    "loss_scaled": float(loss_scaled.detach().cpu().item()),
-                    "lr": lr,
-                    "tokens_seen_total": int(tokens_seen_total) if lr_sched == "token_wcc" else 0,
-                    "ema_m": m,
-                    "grad_norm": float(grad_norm.detach().cpu().item()) if grad_norm is not None else 0.0,
-                    "vicreg_loss": float((vic_loss_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
-                    "vicreg_var": float((vic_var_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
-                    "vicreg_cov": float((vic_cov_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
-                    "ctx_tokens_max": int((~pad_ctx).sum(dim=1).max().detach().cpu().item()),
-                    "tgt_tokens_max": int((~pad_tgt).sum(dim=1).max().detach().cpu().item()),
-                    "ctx_tokens_sum": int((~pad_ctx).sum().detach().cpu().item()),
-                    "tgt_tokens_sum": int((~pad_tgt).sum().detach().cpu().item()),
-                    "batch_size_samples": int(B),
-                    "bucket_C": bucket_C,
-                    "bucket_P": bucket_P,
-                    "bucket_tok_per_sample": bucket_tok_per_sample,
-                    "tokens_per_batch_cfg": int(train_cfg.tokens_per_batch),
-                    "steps_time": float((time.time() - start_time) / train_cfg.log_every),
-                    "spatial_emb_scale": float(student_raw.coord_embed.emb_w.detach().cpu().item()),
-                    "spec_loss": spec_loss,
-                    "spec_lam": spec_lam,
-                }
-
-                # cheap proxy metrics (representation health checks)
-                if proxy_enabled and (proxy_n is not None):
-                    n = float(proxy_n.detach().cpu().item())
-                    if n > 0:
-                        cos_mean = float((proxy_cos_sum / proxy_n.clamp_min(1.0)).detach().cpu().item())
-                        pred_norm_mean = float((proxy_pred_norm_sum / proxy_n.clamp_min(1.0)).detach().cpu().item())
-                        tgt_norm_mean = float((proxy_tgt_norm_sum / proxy_n.clamp_min(1.0)).detach().cpu().item())
-                        pred_norm_var = (proxy_pred_norm_sumsq / proxy_n.clamp_min(1.0)) - (proxy_pred_norm_sum / proxy_n.clamp_min(1.0)) ** 2
-                        tgt_norm_var = (proxy_tgt_norm_sumsq / proxy_n.clamp_min(1.0)) - (proxy_tgt_norm_sum / proxy_n.clamp_min(1.0)) ** 2
-                        pred_norm_std = float(torch.clamp(pred_norm_var, min=0.0).sqrt().detach().cpu().item())
-                        tgt_norm_std = float(torch.clamp(tgt_norm_var, min=0.0).sqrt().detach().cpu().item())
-
-                        logs.update({
-                            "proxy/cos_mean": cos_mean,
-                            "proxy/pred_norm_mean": pred_norm_mean,
-                            "proxy/pred_norm_std": pred_norm_std,
-                            "proxy/tgt_norm_mean": tgt_norm_mean,
-                            "proxy/tgt_norm_std": tgt_norm_std,
-                            "proxy/pred_feat_std_last": float(proxy_last_pred_feat_std.detach().cpu().item()),
-                            "proxy/tgt_feat_std_last": float(proxy_last_tgt_feat_std.detach().cpu().item()),
-                            "proxy/cos_mean_last": float(proxy_last_cos_mean.detach().cpu().item()),
-                            "proxy/n_tokens": n,
-                        })
-                if manual_accum:
-                    logs.update({
-                        "accum_tokens": int(accum_tokens),
-                        "accum_tokens_overshoot": float(max(0, int(accum_tokens) - int(budget_tokens)) / int(budget_tokens)),
-                        "accum_micro": int(accum_micro),
-                        "accum_unique_buckets": int(len(accum_bucket_keys)),
-                        "accum_basis": accum_basis,
-                        "tokens_per_update": int(budget_tokens),
-                    })
-
-                if metrics_writer is not None:
-                    metrics_writer.write(global_step, logs)
-                accelerator.log(logs, step=global_step)
-                start_time = time.time()
-
-            if (train_cfg.save_every > 0) and ((global_step + 1) % train_cfg.save_every == 0):
-            # if accelerator.is_main_process and (global_step % train_cfg.save_every == 0):
-                accelerator.wait_for_everyone()
-                ckpt_dir = os.path.join(train_cfg.output_dir, f"step_{global_step+1:07d}")
-                os.makedirs(ckpt_dir, exist_ok=True)
                 if accelerator.is_main_process:
-                    student_raw.save_pretrained(os.path.join(ckpt_dir, f"student_{global_step+1:07d}"))
-                    torch.save(predictor_raw.state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step+1:07d}.pt"))
-                    teacher_raw.save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step+1:07d}"))
-
-                    _save_trainer_state(
-                        os.path.join(ckpt_dir, "trainer_state.json"),
-                        global_step_next=global_step + 1,
-                        passes_completed=passes_completed,
-                        batches_seen_in_pass=batches_seen_in_pass,
-                        pass_input_tokens=pass_input_tokens,
-                        pass_target_tokens=pass_target_tokens,
-                        pass_context_tokens=pass_context_tokens,
-                        pass_eff_target_tokens=pass_eff_target_tokens,
-                        tokens_seen_total=tokens_seen_total,
-                        schedule_total_steps=schedule_total_steps,
-                        ema_total_steps=ema_total_steps,
-                        lr_total_tokens=resolved_lr_total_tokens,
-                        lr_warmup_tokens=resolved_lr_warmup_tokens,
-                        lr_cooldown_tokens=resolved_lr_cooldown_tokens,            
-                        shard_source=shard_ctx["shard_source"],
-                        current_window_id=shard_ctx["current_window_id"],
-                        shard_list_hash=shard_ctx["shard_list_hash"],
+                    pbar.write(f"[data] pass {passes_completed} completed. Step: {global_step}")
+                    pbar.write(
+                        f"Input Tokens: {pass_input_tokens}, "
+                        f"Target Tokens: {pass_target_tokens}, "
+                        f"Context Tokens: {pass_context_tokens}"
                     )
-                accelerator.save_state(os.path.join(ckpt_dir, f"accelerator_state_{global_step+1:07d}"))
-                accelerator.wait_for_everyone()
+                    pbar.write(
+                        f"Effective Target Tokens: {pass_eff_target_tokens}, "
+                        f"Step Equivalent Tokens: "
+                        f"{(pass_eff_target_tokens / max(1, budget_tokens)) if use_token_budget else 0.0:.2f}"
+                    )
 
-            # reset accumulation window
-            accum_tokens = 0
-            accum_micro = 0
-            accum_bucket_keys = set()
-            accum_tokens_eff = 0
+                # reset current-pass counters on ALL ranks
+                pass_input_tokens = 0
+                pass_target_tokens = 0
+                pass_context_tokens = 0
+                pass_eff_target_tokens = 0
+                batches_seen_in_pass = 0
 
-            if proxy_enabled:
-                proxy_n.zero_()
-                proxy_cos_sum.zero_()
-                proxy_pred_norm_sum.zero_()
-                proxy_pred_norm_sumsq.zero_()
-                proxy_tgt_norm_sum.zero_()
-                proxy_tgt_norm_sumsq.zero_()
-                proxy_last_pred_feat_std.zero_()
-                proxy_last_tgt_feat_std.zero_()
-                proxy_last_cos_mean.zero_()
+                it = iter(loader)
+                with record_function("batch.fetch.reset"):
+                    batch = next(it)
+                batches_seen_in_pass = 1
 
-            if vic_log:
-                vic_loss_sum.zero_()
-                vic_var_sum.zero_()
-                vic_cov_sum.zero_()
-                vic_w_sum.zero_()
+            with record_function("batch.to_device"):
+                x = batch["eeg"].to(dev, non_blocking=True)          # (B,C,T)
+                coords = batch["coord"].to(dev, non_blocking=True)   # (B,C,3)
+                n_channels = batch["n_channels"].to(dev, non_blocking=True)
+                n_patches = batch["n_patches"].to(dev, non_blocking=True)
+                target_mask = batch.get("target_mask", None)
+                if target_mask is not None:
+                    target_mask = target_mask.to(dev, non_blocking=True)
+            with record_function("preprocess.rescale"):
+                x = rescale_small_segments(x, target_rms=1.0, rms_low=0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
+            B, C_max, _ = x.shape
+            P_max = int(batch["n_patches"][0].item())
 
-            global_step += 1
-            pbar.update(1)
-            pbar.set_postfix({"loss": f"{float(loss_log.detach().cpu()):.4f}", "lr": f"{lr:.2e}"})
+            # valid token mask (B,C,P)
+            # chan_ok = (torch.arange(C_max, device=x.device)[None, :, None] < n_channels[:, None, None])
+            # time_ok = (torch.arange(P_max, device=x.device)[None, None, :] < n_patches[:, None, None])
+            # valid = chan_ok & time_ok  # (B,C,P)
+            valid = torch.ones((B, C_max, P_max), dtype=torch.bool, device=x.device)
+
+            # ---------------------------------
+            # 0) decide whether to sync gradients this micro-batch
+            # ---------------------------------
+            bucket_key = (int(x.shape[1]), int(P_max))
+
+            # We decide sync *after* we know token counts (needs mask),
+            # but to avoid duplicating logic, we default to no_sync context and
+            # override later.
+
+            # 1) JEPA target mask (B,C,P)
+            with record_function("mask.sample"):
+                if target_mask is None:
+                    target_mask = sample_jepa_target_mask(
+                        coords=coords,
+                        n_channels=n_channels,
+                        n_patches=n_patches,
+                        mask_time_prob=train_cfg.mask_time_prob,
+                        mask_spatial_prob=train_cfg.mask_spatial_prob,
+                        time_ratio_range=(train_cfg.time_mask_ratio_min, train_cfg.time_mask_ratio_max),
+                        spatial_ratio_range=(train_cfg.spatial_mask_ratio_min, train_cfg.spatial_mask_ratio_max),
+                        time_mask_style=train_cfg.time_mask_style,
+                        time_mask_num_blocks=train_cfg.time_mask_num_blocks,
+                        time_mask_min_block_patches=train_cfg.time_mask_min_block_patches,
+                        time_ssp_keep_blocks=train_cfg.time_ssp_keep_blocks,
+                        time_ssp_min_keep_patches=train_cfg.time_ssp_min_keep_patches,
+                    )
+                    # optional dilation to reduce overlap leakage
+                    if train_cfg.mask_dilate_time and train_cfg.mask_dilate_time > 0:
+                        target_mask = dilate_time_mask(target_mask, dilation=int(train_cfg.mask_dilate_time))
+                else:
+                    target_mask = target_mask.to(dtype=torch.bool)
+
+                target_mask = target_mask & valid
+                context_mask = (~target_mask) & valid
+
+            # token counts for token-budget accumulation
+            if manual_accum:
+                if use_token_budget:
+                    if accum_basis == "valid":
+                        tokens_this = int(B) * int(x.shape[1]) * int(P_max)
+                    elif accum_basis == "context":
+                        tokens_this = int(context_mask.sum().item())
+                    else:  # default: "target"
+                        tokens_this = int(target_mask.sum().item())
+                else:
+                    tokens_this = 1
+            else:
+                tokens_this = 0
+
+            if manual_accum:
+                if use_token_budget:
+                    # always do at least 1 micro-batch per optimizer step
+                    if accum_tokens == 0 and tokens_this <= 0:
+                        will_step = True
+                    else:
+                        will_step = (accum_tokens + tokens_this) >= max(1, budget_tokens)
+                else:
+                    will_step = (accum_micro + 1) >= max(1, budget_tokens)
+            else:
+                will_step = True
+
+            # DDP gradient sync control
+            no_sync = manual_accum and (not will_step) and (accelerator.num_processes > 1)
+
+            # effective tokens contributed by this micro-batch (used for token-based LR schedule + regularizers)
+            tokens_eff_this = int(tokens_this)
+            if manual_accum and use_token_budget and (budget_tokens > 0) and will_step:
+                remain = max(0, int(budget_tokens) - int(accum_tokens))
+                if remain > 0 and int(tokens_this) > remain:
+                    tokens_eff_this = int(remain)
+
+            with ExitStack() as stack:
+                if no_sync:
+                    # avoid all-reduce on non-final micro-batches
+                    if hasattr(student, "no_sync"):
+                        stack.enter_context(student.no_sync())
+                    if hasattr(predictor, "no_sync"):
+                        stack.enter_context(predictor.no_sync())
+
+                # 2) student augmentations (time alignment preserving)
+                with record_function("augment.student"):
+                    x_aug = apply_student_augmentations(
+                        x,
+                        gain_min=train_cfg.aug_gain_min,
+                        gain_max=train_cfg.aug_gain_max,
+                        channel_gain_std=train_cfg.aug_channel_gain_std,
+                        noise_std_min=train_cfg.aug_noise_std_min,
+                        noise_std_max=train_cfg.aug_noise_std_max,
+                        channel_drop_prob=train_cfg.aug_channel_drop_prob,
+                    )
+
+                # 3) freq corruption (student context only)
+                with record_function("freq.corrupt"):
+                    if model_cfg.film_hidden > 0:
+                        freq_domain_drop = (torch.rand((B,), device=x.device) < train_cfg.freq_domain_drop_prob)
+                        freq_mask_bins = sample_freq_bin_mask(
+                            B=B,
+                            K=model_cfg.freq_bins,
+                            bin_centers_hz=bin_centers,
+                            physio_prob=train_cfg.freq_physio_mask_prob,
+                            num_bands_min=train_cfg.freq_num_bands_min,
+                            num_bands_max=train_cfg.freq_num_bands_max,
+                            random_width_min=train_cfg.freq_random_width_min,
+                            random_width_max=train_cfg.freq_random_width_max,
+                            device=x.device,
+                        )
+                    else:
+                        freq_domain_drop = None
+                        freq_mask_bins = None
+
+                # 4) pack indices
+                with record_function("mask.pack"):
+                    c_ctx, t_ctx, pad_ctx = mask_to_packed_indices(context_mask, valid)
+                    c_tgt, t_tgt, pad_tgt = mask_to_packed_indices(target_mask, valid)
+
+                with accelerator.autocast():
+                    # 5) student: embed+encode context only
+                    with record_function("student.coord_embed"):
+                        coord_ch_student = student_raw.coord_embed(coords)  # (B,C,D)
+                    with record_function("student.embed_ctx"):
+                        tok_ctx, pad_ctx, rope_ctx, chan_ctx = student_raw.embed_from_indices(
+                            x=x_aug,
+                            coords=coords,
+                            c_idx=c_ctx,
+                            t_idx=t_ctx,
+                            pad=pad_ctx,
+                            coord_ch=coord_ch_student,
+                            freq_mask_bins=freq_mask_bins,
+                            freq_domain_drop=freq_domain_drop,
+                        )
+                    # NOTE: embed_from_indices is called on the unwrapped module to avoid DDP wrapper issues
+                    # around the unfold/view path. The wrapped model still handles the main encoder forward.
+                    with record_function("student.forward_ctx"):
+                        z_ctx = student(tok_ctx, padding_mask=pad_ctx, rope_pos=rope_ctx, chan_idx=chan_ctx, coords=coords, grid_patches=P_max)  # (B,Lc,D)
+
+                    # 6) teacher: embed+encode targets only (no corruption)
+                    with torch.no_grad():
+                        with record_function("teacher.coord_embed"):
+                            coord_ch_teacher = teacher_raw.coord_embed(coords)  # (B,C,D)
+                        with record_function("teacher.embed_tgt"):
+                            tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher_raw.embed_from_indices(
+                                x=x,
+                                coords=coords,
+                                c_idx=c_tgt,
+                                t_idx=t_tgt,
+                                pad=pad_tgt,
+                                coord_ch=coord_ch_teacher,
+                                freq_mask_bins=None,
+                                freq_domain_drop=None,
+                            )
+                        with record_function("teacher.forward_tgt"):
+                            z_tgt = teacher(tok_tgt, padding_mask=pad_tgt2, rope_pos=rope_tgt, chan_idx=chan_tgt, coords=coords, grid_patches=P_max)  # (B,Lt,D)
+
+                    # 7) predictor: build target queries from coord embeddings + cross-attend to ctx
+                    with record_function("predictor.coord_gather"):
+                        coord_tgt = gather_channel_embeddings(coord_ch_student, c_tgt.clamp(min=0), pad_tgt)   # (B,Lt,D)
+
+                    with record_function("predictor.forward"):
+                        if spec_align_heads is not None:
+                            pred_tgt, pred_hidden = predictor(
+                                ctx=z_ctx,
+                                ctx_pad=pad_ctx,
+                                rope_ctx=rope_ctx,
+                                tgt_coord_emb=coord_tgt,
+                                tgt_pad=pad_tgt,
+                                rope_tgt=rope_tgt,
+                                return_hidden=True,
+                            )  # (B,Lt,D), list of hidden states
+                        else:
+                            pred_tgt = predictor(
+                                ctx=z_ctx,
+                                ctx_pad=pad_ctx,
+                                rope_ctx=rope_ctx,
+                                tgt_coord_emb=coord_tgt,
+                                tgt_pad=pad_tgt,
+                                rope_tgt=rope_tgt,
+                            )  # (B,Lt,D)
+                            pred_hidden = None
+
+                    # 8) loss on non-pad targets
+                    valid_tgt = ~pad_tgt
+                    num_tgt_tensor = valid_tgt.sum().float().clamp_min(1.0)
+
+                    # sum reduction for token-budget scaling
+                    with record_function("loss.main"):
+                        diff = torch.abs(pred_tgt - z_tgt)
+                        diff = diff.masked_fill(pad_tgt[..., None], 0.0)
+                        loss_sum = diff.sum().float()
+                        # loss_sum = F.l1_loss(pred_tgt[valid_tgt], z_tgt[valid_tgt], reduction="sum").float()
+                    
+                    spec_align_loss = None
+                    if spec_align_heads is not None:
+                        with record_function("loss.spec_align"):
+                            # target patches gather
+                            patches_view = student_raw.extract_patches_view(x)  # (B,C,P,S)
+                            c_safe = c_tgt.clamp(min=0)
+                            t_safe = t_tgt.clamp(min=0)
+                            B_, Lt = c_safe.shape
+                            b_idx = torch.arange(B_, device=x.device)[:, None].expand(B_, Lt)
+                            patches_tgt = patches_view[b_idx, c_safe, t_safe]   # (B,Lt,S)
+                            patches_flat = patches_tgt[valid_tgt].to(torch.float32)
+
+                            spec_target = compute_logspec_view(
+                                patches_flat,
+                                fs=model_cfg.sample_rate,
+                                f_min=model_cfg.freq_min_hz,
+                                f_max=model_cfg.freq_max_hz,
+                                per_patch_zscore=True,
+                            )  # (Nvalid, Fsel)
+
+                            spec_target = F.normalize(spec_target, dim=-1)
+
+                            # 어떤 layer들을 쓸지 선택
+                            layer_indices = getattr(train_cfg, "spec_align_layer_indices", None)
+                            if layer_indices is None or layer_indices == "all":
+                                use_layers = list(range(len(pred_hidden)))
+                            else:
+                                use_layers = layer_indices  # e.g. [-2, -1] or [0,1]
+
+                            layer_losses = []
+                            for li in use_layers:
+                                h = pred_hidden[li][valid_tgt]      # (Nvalid, D)
+                                h_proj = spec_align_heads.forward_one(h, li)  # (Nvalid, Fsel)
+                                h_proj = F.normalize(h_proj, dim=-1)
+                                layer_losses.append(1.0 - (h_proj * spec_target).sum(dim=-1).mean())
+
+                            spec_align_loss = torch.stack(layer_losses).mean()
+
+                            # warmup/ramp
+                            lam0 = float(getattr(train_cfg, "spec_align_weight", 0.0))
+                            warm = int(getattr(train_cfg, "spec_align_warmup_steps", 0))
+                            ramp = int(getattr(train_cfg, "spec_align_ramp_steps", 0))
+                            if global_step < warm:
+                                lam = 0.0
+                            elif ramp > 0:
+                                u = min(1.0, float(global_step - warm) / float(ramp))
+                                lam = lam0 * u
+                            else:
+                                lam = lam0
+
+                            loss_sum = loss_sum + lam * spec_align_loss
+
+                    spec_rel_loss = None
+                    if rel_z_projector is not None:
+                        with record_function("loss.spec_rel"):
+                            # target patches -> fixed raw log-spectrum
+                            patches_view = student_raw.extract_patches_view(x)
+                            c_safe = c_tgt.clamp(min=0)
+                            t_safe = t_tgt.clamp(min=0)
+                            B_, Lt = c_safe.shape
+                            b_idx = torch.arange(B_, device=x.device)[:, None].expand(B_, Lt)
+                            patches_tgt = patches_view[b_idx, c_safe, t_safe]
+                            valid_tgt = ~pad_tgt
+
+                            patches_flat = patches_tgt[valid_tgt].to(torch.float32)
+                            spec_target = compute_logspec_view(
+                                patches_flat,
+                                fs=model_cfg.sample_rate,
+                                f_min=model_cfg.freq_min_hz,
+                                f_max=model_cfg.freq_max_hz,
+                                per_patch_zscore=True,
+                            )  # (Nvalid, Fsel)
+
+                            z_flat = pred_tgt[valid_tgt]  # (Nvalid, D)
+
+                            # O(N^2)라 subsample 필수
+                            M = int(getattr(train_cfg, "spec_rel_subsample_tokens", 512))
+                            Nvalid = z_flat.shape[0]
+                            if Nvalid > M:
+                                idx = torch.randperm(Nvalid, device=x.device)[:M]
+                                z_flat = z_flat[idx]
+                                spec_target = spec_target[idx]
+
+                            z_rel = rel_z_projector(z_flat)  # (M, Drel)
+
+                            spec_rel_loss = relational_kl_loss(
+                                z=z_rel,
+                                s=spec_target,  # dimension 달라도 관계행렬만 비교하므로 OK
+                                tau_z=float(getattr(train_cfg, "spec_rel_tau_z", 0.1)),
+                                tau_s=float(getattr(train_cfg, "spec_rel_tau_s", 0.1)),
+                            )
+
+                            lam0 = float(getattr(train_cfg, "spec_rel_weight", 0.0))
+                            warm = int(getattr(train_cfg, "spec_rel_warmup_steps", 0))
+                            ramp = int(getattr(train_cfg, "spec_rel_ramp_steps", 0))
+                            if global_step < warm:
+                                lam = 0.0
+                            elif ramp > 0:
+                                u = min(1.0, float(global_step - warm) / float(ramp))
+                                lam = lam0 * u
+                            else:
+                                lam = lam0
+
+                            loss_sum = loss_sum + lam * spec_rel_loss
+
+                    # scale loss so that one optimizer step ~= (tokens_per_update) worth of supervision
+                    weight = 1.0
+                    if manual_accum:
+                        denom_tokens = max(1, budget_tokens)
+                        if use_token_budget:
+                            if accum_basis != "target":
+                                # If you set accum_basis != target, you're effectively optimizing "loss per (basis) token".
+                                # This is allowed, but note that supervision exists only on target tokens.
+                                pass
+                            # fractional weight for the last micro-batch to hit the token budget more tightly
+                            if will_step and denom_tokens > 0:
+                                remain = max(0, denom_tokens - int(accum_tokens))
+                                if tokens_this > 0 and remain > 0 and tokens_this > remain:
+                                    weight = float(remain) / float(tokens_this)
+                                elif remain == 0:
+                                    weight = 1.0
+                            loss_scaled = (loss_sum * float(weight)) / (float(denom_tokens) * float(model_cfg.d_model))
+                        else:
+                            # fixed micro-batch accumulation: average loss across micro-batches
+                            loss_scaled = (loss_sum / (num_tgt_tensor * model_cfg.d_model)) / denom_tokens
+                    else:
+                        # single-step: standard mean loss
+                        loss_scaled = loss_sum / (num_tgt_tensor * model_cfg.d_model)
+
+                    loss_log = loss_sum / (num_tgt_tensor * model_cfg.d_model)
+
+                    # ------------------------------------------------------------
+                    # (Optional) VICReg-style variance/cov regularizer
+                    # ------------------------------------------------------------
+                    vic_w = float(getattr(train_cfg, "vicreg_weight", 0.0) or 0.0)
+                    vic_apply = str(getattr(train_cfg, "vicreg_apply_to", "pred")).lower().strip()
+                    vic_gamma = float(getattr(train_cfg, "vicreg_gamma", 1.0) or 1.0)
+                    vic_var_w = float(getattr(train_cfg, "vicreg_var_weight", 1.0) or 1.0)
+                    vic_cov_w = float(getattr(train_cfg, "vicreg_cov_weight", 1.0) or 1.0)
+                    vic_max = int(getattr(train_cfg, "vicreg_max_tokens", 0) or 0)
+
+                    if vic_w > 0:
+                        if vic_apply == "ctx":
+                            valid_ctx_tmp = ~pad_ctx
+                            denom_c = valid_ctx_tmp.sum(dim=1).clamp_min(1).to(z_ctx.dtype)
+                            feats = (z_ctx * valid_ctx_tmp[..., None]).sum(dim=1) / denom_c[:, None]  # (B,D)
+                            feats = feats.float()
+                        else:
+                            feats = pred_tgt[valid_tgt].float()  # (Nt,D)
+
+                        if vic_max > 0 and feats.shape[0] > vic_max:
+                            idx = torch.randperm(feats.shape[0], device=feats.device)[:vic_max]
+                            feats = feats.index_select(0, idx)
+
+                        base, vvar, vcov = vicreg_var_cov_loss(feats, gamma=vic_gamma, var_weight=vic_var_w, cov_weight=vic_cov_w)
+                        vic_loss = vic_w * base
+
+                        # scale to be invariant to #micro-batches per optimizer update
+                        reg_scale = 1.0
+                        if manual_accum:
+                            if use_token_budget:
+                                reg_scale = float(tokens_eff_this) / float(max(1, budget_tokens))
+                            else:
+                                reg_scale = float(weight) / float(max(1, budget_tokens))
+
+                        loss_scaled = loss_scaled + vic_loss * float(reg_scale)
+
+                        if 'vic_log' in locals() and vic_log:
+                            vic_loss_sum += vic_loss.detach().float() * float(reg_scale)
+                            vic_var_sum += vvar.detach().float() * float(reg_scale)
+                            vic_cov_sum += vcov.detach().float() * float(reg_scale)
+                            vic_w_sum += float(reg_scale)
+
+                    # ---------------------------------
+                    # Cheap proxy stats (logged on optimizer step)
+                    # ---------------------------------
+                    if proxy_enabled:
+                        with torch.no_grad():
+                            pred_f = pred_tgt[valid_tgt].detach().float()
+                            tgt_f = z_tgt[valid_tgt].detach().float()
+
+                            # subsample tokens to keep this cheap
+                            max_proxy = int(getattr(train_cfg, "proxy_max_tokens", 0) or 0)
+                            if max_proxy > 0 and pred_f.shape[0] > max_proxy:
+                                idx = torch.linspace(0, pred_f.shape[0] - 1, steps=max_proxy, device=pred_f.device).long()
+                                pred_f = pred_f.index_select(0, idx)
+                                tgt_f = tgt_f.index_select(0, idx)
+
+                            w = float(weight)
+                            n_proxy = float(pred_f.shape[0])
+                            if n_proxy > 0:
+                                cos = F.cosine_similarity(pred_f, tgt_f, dim=-1)
+                                proxy_last_cos_mean = cos.mean()
+                                proxy_cos_sum += cos.sum() * w
+                                proxy_n += n_proxy * w
+
+                                pn = pred_f.norm(dim=-1)
+                                tn = tgt_f.norm(dim=-1)
+                                proxy_pred_norm_sum += pn.sum() * w
+                                proxy_pred_norm_sumsq += (pn ** 2).sum() * w
+                                proxy_tgt_norm_sum += tn.sum() * w
+                                proxy_tgt_norm_sumsq += (tn ** 2).sum() * w
+
+                                proxy_last_pred_feat_std = pred_f.std(unbiased=False)
+                                proxy_last_tgt_feat_std = tgt_f.std(unbiased=False)
+
+                with record_function("train.backward"):
+                    accelerator.backward(loss_scaled)
+            
+            
+            pass_input_tokens += valid.sum().detach()
+            pass_target_tokens += target_mask.sum().detach()
+            pass_context_tokens += context_mask.sum().detach()
+            pass_eff_target_tokens += int(tokens_eff_this)
+            # update accumulation stats
+            if manual_accum:
+                accum_tokens += int(tokens_this)
+                accum_tokens_eff += int(tokens_eff_this)
+                accum_micro += 1
+                accum_bucket_keys.add(bucket_key)
+
+            # ---------------------------------
+            # Optimizer step boundary
+            # ---------------------------------
+            do_step = bool(will_step)
+
+            if do_step:
+                grad_norm = None
+                if train_cfg.grad_clip and train_cfg.grad_clip > 0:
+                    with record_function("optim.clip_grad"):
+                        grad_norm = accelerator.clip_grad_norm_(list(student.parameters()) + list(predictor.parameters()), train_cfg.grad_clip)
+
+                # LR schedule
+                if lr_sched == "token_wcc":
+                    total_toks = int(resolved_lr_total_tokens)
+                    warm_toks = int(resolved_lr_warmup_tokens)
+                    cool_toks = int(resolved_lr_cooldown_tokens)
+                    min_lr = float(getattr(train_cfg, "min_lr", 0.0) or 0.0)
+                    tokens_next = int(tokens_seen_total) + int(accum_tokens_eff)
+                    lr = token_wcc_lr(tokens_next, warm_toks, total_toks, cool_toks, train_cfg.lr, min_lr)
+                else:
+                    lr = cosine_warmup(global_step, train_cfg.warmup_steps, schedule_total_steps, train_cfg.lr)
+
+                for pg in opt.param_groups:
+                    pg["lr"] = lr
+
+                with record_function("optim.step"):
+                    opt.step()
+                    opt.zero_grad(set_to_none=True)
+
+                if lr_sched == "token_wcc":
+                    tokens_seen_total = int(tokens_seen_total) + int(accum_tokens_eff)
+
+                m = ema_momentum_schedule(global_step, ema_total_steps, train_cfg.ema_momentum, train_cfg.ema_momentum_final)
+                with record_function("ema.update"):
+                    update_ema(teacher=teacher_raw, student=student_raw, m=m)
+
+                if accelerator.is_main_process and (global_step % train_cfg.log_every == 0):
+                    # bucket key (shape) for this micro-batch (ShapeBatcher guarantees same (C,P) inside micro-batch)
+                    log_bucket = bool(getattr(train_cfg, "log_bucket_key", True))
+                    if log_bucket:
+                        bucket_C = int(n_channels[0].detach().cpu().item())
+                        bucket_P = int(n_patches[0].detach().cpu().item())
+                        bucket_tok_per_sample = int(bucket_C * bucket_P)
+                    else:
+                        bucket_C = 0
+                        bucket_P = 0
+                        bucket_tok_per_sample = 0
+
+                    if spec_align_loss is not None:
+                        spec_loss = float(spec_align_loss.detach().cpu().item())
+                        spec_lam = float(lam)
+                    elif spec_rel_loss is not None:
+                        spec_loss = float(spec_rel_loss.detach().cpu().item())
+                        spec_lam = float(lam)
+                    else:
+                        spec_loss = 0.0
+                        spec_lam = 0.0
+
+                    logs = {
+                        "loss_tgt_mean": float(loss_log.detach().cpu().item()),
+                        "loss_scaled": float(loss_scaled.detach().cpu().item()),
+                        "lr": lr,
+                        "tokens_seen_total": int(tokens_seen_total) if lr_sched == "token_wcc" else 0,
+                        "ema_m": m,
+                        "grad_norm": float(grad_norm.detach().cpu().item()) if grad_norm is not None else 0.0,
+                        "vicreg_loss": float((vic_loss_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
+                        "vicreg_var": float((vic_var_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
+                        "vicreg_cov": float((vic_cov_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
+                        "ctx_tokens_max": int((~pad_ctx).sum(dim=1).max().detach().cpu().item()),
+                        "tgt_tokens_max": int((~pad_tgt).sum(dim=1).max().detach().cpu().item()),
+                        "ctx_tokens_sum": int((~pad_ctx).sum().detach().cpu().item()),
+                        "tgt_tokens_sum": int((~pad_tgt).sum().detach().cpu().item()),
+                        "batch_size_samples": int(B),
+                        "bucket_C": bucket_C,
+                        "bucket_P": bucket_P,
+                        "bucket_tok_per_sample": bucket_tok_per_sample,
+                        "tokens_per_batch_cfg": int(train_cfg.tokens_per_batch),
+                        "steps_time": float((time.time() - start_time) / train_cfg.log_every),
+                        "spatial_emb_scale": float(student_raw.coord_embed.emb_w.detach().cpu().item()),
+                        "spec_loss": spec_loss,
+                        "spec_lam": spec_lam,
+                    }
+
+                    # cheap proxy metrics (representation health checks)
+                    if proxy_enabled and (proxy_n is not None):
+                        n = float(proxy_n.detach().cpu().item())
+                        if n > 0:
+                            cos_mean = float((proxy_cos_sum / proxy_n.clamp_min(1.0)).detach().cpu().item())
+                            pred_norm_mean = float((proxy_pred_norm_sum / proxy_n.clamp_min(1.0)).detach().cpu().item())
+                            tgt_norm_mean = float((proxy_tgt_norm_sum / proxy_n.clamp_min(1.0)).detach().cpu().item())
+                            pred_norm_var = (proxy_pred_norm_sumsq / proxy_n.clamp_min(1.0)) - (proxy_pred_norm_sum / proxy_n.clamp_min(1.0)) ** 2
+                            tgt_norm_var = (proxy_tgt_norm_sumsq / proxy_n.clamp_min(1.0)) - (proxy_tgt_norm_sum / proxy_n.clamp_min(1.0)) ** 2
+                            pred_norm_std = float(torch.clamp(pred_norm_var, min=0.0).sqrt().detach().cpu().item())
+                            tgt_norm_std = float(torch.clamp(tgt_norm_var, min=0.0).sqrt().detach().cpu().item())
+
+                            logs.update({
+                                "proxy/cos_mean": cos_mean,
+                                "proxy/pred_norm_mean": pred_norm_mean,
+                                "proxy/pred_norm_std": pred_norm_std,
+                                "proxy/tgt_norm_mean": tgt_norm_mean,
+                                "proxy/tgt_norm_std": tgt_norm_std,
+                                "proxy/pred_feat_std_last": float(proxy_last_pred_feat_std.detach().cpu().item()),
+                                "proxy/tgt_feat_std_last": float(proxy_last_tgt_feat_std.detach().cpu().item()),
+                                "proxy/cos_mean_last": float(proxy_last_cos_mean.detach().cpu().item()),
+                                "proxy/n_tokens": n,
+                            })
+                    if manual_accum:
+                        logs.update({
+                            "accum_tokens": int(accum_tokens),
+                            "accum_tokens_overshoot": float(max(0, int(accum_tokens) - int(budget_tokens)) / int(budget_tokens)),
+                            "accum_micro": int(accum_micro),
+                            "accum_unique_buckets": int(len(accum_bucket_keys)),
+                            "accum_basis": accum_basis,
+                            "tokens_per_update": int(budget_tokens),
+                        })
+
+                    if metrics_writer is not None:
+                        metrics_writer.write(global_step, logs)
+                    accelerator.log(logs, step=global_step)
+                    start_time = time.time()
+
+                if (train_cfg.save_every > 0) and ((global_step + 1) % train_cfg.save_every == 0):
+                # if accelerator.is_main_process and (global_step % train_cfg.save_every == 0):
+                    accelerator.wait_for_everyone()
+                    ckpt_dir = os.path.join(train_cfg.output_dir, f"step_{global_step+1:07d}")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    if accelerator.is_main_process:
+                        student_raw.save_pretrained(os.path.join(ckpt_dir, f"student_{global_step+1:07d}"))
+                        torch.save(predictor_raw.state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step+1:07d}.pt"))
+                        teacher_raw.save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step+1:07d}"))
+
+                        _save_trainer_state(
+                            os.path.join(ckpt_dir, "trainer_state.json"),
+                            global_step_next=global_step + 1,
+                            passes_completed=passes_completed,
+                            batches_seen_in_pass=batches_seen_in_pass,
+                            pass_input_tokens=pass_input_tokens,
+                            pass_target_tokens=pass_target_tokens,
+                            pass_context_tokens=pass_context_tokens,
+                            pass_eff_target_tokens=pass_eff_target_tokens,
+                            tokens_seen_total=tokens_seen_total,
+                            schedule_total_steps=schedule_total_steps,
+                            ema_total_steps=ema_total_steps,
+                            lr_total_tokens=resolved_lr_total_tokens,
+                            lr_warmup_tokens=resolved_lr_warmup_tokens,
+                            lr_cooldown_tokens=resolved_lr_cooldown_tokens,            
+                            shard_source=shard_ctx["shard_source"],
+                            current_window_id=shard_ctx["current_window_id"],
+                            shard_list_hash=shard_ctx["shard_list_hash"],
+                        )
+                    accelerator.save_state(os.path.join(ckpt_dir, f"accelerator_state_{global_step+1:07d}"))
+                    accelerator.wait_for_everyone()
+
+                # reset accumulation window
+                accum_tokens = 0
+                accum_micro = 0
+                accum_bucket_keys = set()
+                accum_tokens_eff = 0
+
+                if proxy_enabled:
+                    proxy_n.zero_()
+                    proxy_cos_sum.zero_()
+                    proxy_pred_norm_sum.zero_()
+                    proxy_pred_norm_sumsq.zero_()
+                    proxy_tgt_norm_sum.zero_()
+                    proxy_tgt_norm_sumsq.zero_()
+                    proxy_last_pred_feat_std.zero_()
+                    proxy_last_tgt_feat_std.zero_()
+                    proxy_last_cos_mean.zero_()
+
+                if vic_log:
+                    vic_loss_sum.zero_()
+                    vic_var_sum.zero_()
+                    vic_cov_sum.zero_()
+                    vic_w_sum.zero_()
+
+                global_step += 1
+                pbar.update(1)
+                pbar.set_postfix({"loss": f"{float(loss_log.detach().cpu()):.4f}", "lr": f"{lr:.2e}"})
+
+                prof.step() # 프로파일러에게 1스텝이 끝났다고 알려줌
+                if global_step > (n_wait + n_warm + n_act + 1):
+                    if accelerator.is_main_process:
+                        print("\n[Profiler] 10스텝 완료. 프로파일링을 위해 강제 종료합니다.")
+                    break # 10번 찍었으면 뒤도 돌아보지 말고 탈출!
 
     pbar.close()
 
