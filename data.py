@@ -222,10 +222,44 @@ def split_long_and_fit(
 
     return outs
 
+def mask_to_packed_indices_cpu(mask: torch.Tensor):
+    """
+    mask: (B,C,P) bool on CPU
+    returns c_idx, t_idx, pad on CPU
+    time-major order (t,c)
+    """
+    assert mask.device.type == "cpu"
+    B, C, P = mask.shape
+    mask_tc = mask.permute(0, 2, 1).reshape(B, P * C)   # (B, P*C)
+    lengths = mask_tc.sum(dim=1, dtype=torch.long)      # CPU tensor
+    Lmax = int(lengths.max()) if lengths.numel() > 0 else 0
+    if Lmax <= 0:
+        Lmax = 1
+
+    c_idx = torch.zeros((B, Lmax), dtype=torch.long)
+    t_idx = torch.zeros((B, Lmax), dtype=torch.long)
+    pad = torch.ones((B, Lmax), dtype=torch.bool)
+
+    nz = mask_tc.nonzero(as_tuple=False)  # CPU nonzero
+    if nz.numel() == 0:
+        return c_idx, t_idx, pad
+
+    b = nz[:, 0]
+    tc = nz[:, 1]
+    starts = torch.cumsum(lengths, dim=0) - lengths
+    pos = torch.arange(nz.shape[0], dtype=torch.long) - torch.repeat_interleave(starts, lengths)
+
+    t_idx[b, pos] = torch.div(tc, C, rounding_mode="floor")
+    c_idx[b, pos] = tc.remainder(C)
+    pad[b, pos] = False
+    return c_idx, t_idx, pad
+
+
 def collate_stack(
     batch: List[Dict[str, Any]],
     patch_samples: int,
     hop_samples: int,
+    *,
     emit_target_mask: bool = False,
     target_mask_cfg: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -253,21 +287,37 @@ def collate_stack(
         "coord": coord,
         "n_channels": n_channels,
         "n_patches": n_patches,
+        "valid_tokens": int(B * C * P),
+        "P_max_cpu": int(P),
+        "C_max_cpu": int(C),
     }
 
     if emit_target_mask:
         assert target_mask_cfg is not None, "target_mask_cfg is required when emit_target_mask=True"
         assert int(target_mask_cfg["time_mask_style"]) == 3, "worker fast path is style-3 only"
 
-        out["target_mask"] = sample_jepa_target_mask_same_shape_style3_cpu(
+        target_mask = sample_jepa_target_mask_same_shape_style3_cpu(
             coords=coord,
             P_t=P,
-            mask_time_prob=float(target_mask_cfg["mask_time_prob"]),
-            mask_spatial_prob=float(target_mask_cfg["mask_spatial_prob"]),
-            time_ratio_range=tuple(target_mask_cfg["time_ratio_range"]),
-            spatial_ratio_range=tuple(target_mask_cfg["spatial_ratio_range"]),
-            dilate_time=int(target_mask_cfg.get("mask_dilate_time", 0)),
+            **target_mask_cfg
         )
+        context_mask = ~target_mask
+
+        c_ctx, t_ctx, pad_ctx = mask_to_packed_indices_cpu(context_mask)
+        c_tgt, t_tgt, pad_tgt = mask_to_packed_indices_cpu(target_mask)
+
+        out.update({
+            "target_mask": target_mask,
+            "context_mask": context_mask,
+            "c_ctx": c_ctx,
+            "t_ctx": t_ctx,
+            "pad_ctx": pad_ctx,
+            "c_tgt": c_tgt,
+            "t_tgt": t_tgt,
+            "pad_tgt": pad_tgt,
+            "target_tokens": int(target_mask.sum()),
+            "context_tokens": int(context_mask.sum()),
+        })
 
     return out
 

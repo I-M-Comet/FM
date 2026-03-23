@@ -19,14 +19,14 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    "ROOT_DIR": "D:/open_eeg/siena",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/physionet_siena/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg/ds005662",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds005662/eeg-%06d.tar", # 결과 파일 패턴
 
-    "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
-    # "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    # "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     
     # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr", ".gdf" 등)
-    "FILE_EXT": "*.edf", 
+    "FILE_EXT": "*.bdf", 
 
     # [중요] EDF가 아닌 파일(MAT, TSV)을 위한 강제 설정
     # EDF 파일은 아래 두 설정이 무시됩니다 (파일 헤더 정보 사용).

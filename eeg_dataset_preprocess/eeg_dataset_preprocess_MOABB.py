@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 # MOABB 관련 임포트
 import moabb
-from moabb.datasets import Liu2024, Schirrmeister2017
+from moabb.datasets import Liu2024, Schirrmeister2017, BNCI2015_001
 
 # 불필요한 로그 끄기
 mne.set_log_level("WARNING")
@@ -25,10 +25,10 @@ moabb.set_log_level("info")
 CONFIG = {
     # [MOABB 설정] 사용할 데이터셋 클래스 지정
     # 예: BNCI2014001(), PhysionetMI(), Schirrmeister2017() 등
-    "MOABB_DATASET": Schirrmeister2017(), 
+    "MOABB_DATASET": BNCI2015_001(), 
     
     # 출력 경로
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/moabb_schirrmeister2017/eeg-%06d.tar",
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/moabb_bnci2015_001/eeg-%06d.tar",
     
     # 전처리 파라미터 (데이터셋 특성에 맞게 조절 필요)
     "TARGET_SR": 200,        # 목표 샘플링 레이트

@@ -474,16 +474,21 @@ def vicreg_var_cov_loss(
     return tot, var, cov
 
 
-def ema_momentum_schedule(step: int, total: int, m0: float, m1: float) -> float:
-    progress = step / max(1, total)
-    m = m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress)))
-    return float(m)
+class EMAUpdater:
+    def __init__(self, teacher: torch.nn.Module, student: torch.nn.Module, m0: float):
+        self.teacher_params = list(teacher.parameters())
+        self.student_params = list(student.parameters())
+        self.m = m0
+    
+    def ema_momentum_schedule(self, step: int, total: int, m0: float, m1: float):
+        progress = step / max(1, total)
+        m = m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress)))
+        self.m = float(m)
 
-
-@torch.no_grad()
-def update_ema(teacher: torch.nn.Module, student: torch.nn.Module, m: float):
-    for p_t, p_s in zip(teacher.parameters(), student.parameters()):
-        p_t.data.mul_(m).add_(p_s.data, alpha=(1.0 - m))
+    @torch.no_grad()
+    def update_ema(self):
+        torch._foreach_mul_(self.teacher_params, self.m)
+        torch._foreach_add_(self.teacher_params, self.student_params, alpha = (1.0 - self.m))
 
 
 @torch.no_grad()
@@ -528,32 +533,57 @@ def mask_to_packed_indices(mask: torch.Tensor, valid: torch.Tensor) -> Tuple[tor
     return c_idx, t_idx, pad
 
 
+# @torch.no_grad()
+# def rescale_small_segments(
+#     x: torch.Tensor,            # (B,C,T) fp16/bf16/fp32
+#     target_rms: float = 1.0,
+#     rms_low: float = 0.5,
+#     rms_floor: float = 0.05,
+#     gain_max: float = 8.0,
+#     clip: float = 15.0,
+# ) -> torch.Tensor:
+#     # fp32에서 통계 계산(안정)
+#     x32 = x.float()
+#     # rms = torch.sqrt(torch.mean(x32 * x32, dim=(1,2), keepdim=True) + 1e-8)  # (B,1,1)
+#     rms = torch.sqrt(torch.mean(x32 * x32, dim=-1, keepdim=True) + 1e-8)  # (B,C,1)
+
+#     # rms가 너무 작은 것만 보정
+#     need = (rms < rms_low).to(x32.dtype)  # (B,1,1) 0/1
+#     gain = (target_rms / rms.clamp_min(rms_floor)).clamp(1.0 / gain_max, gain_max)
+
+#     # need==1인 샘플만 스케일 적용
+#     x32 = x32 * (1.0 + need * (gain - 1.0))
+
+#     if clip and clip > 0:
+#         x32 = x32.clamp(-clip, clip)
+
+#     return x32.to(dtype=x.dtype)
+
 @torch.no_grad()
 def rescale_small_segments(
     x: torch.Tensor,            # (B,C,T) fp16/bf16/fp32
-    target_rms: float = 1.0,
-    rms_low: float = 0.5,
-    rms_floor: float = 0.05,
-    gain_max: float = 8.0,
-    clip: float = 15.0,
+    target_amp: float = 1.0,    # 목표 진폭
+    quantile: float = 0.90,     # 상위 10%를 무시하고 90% 위치의 값을 진폭 기준으로 삼음
+    amp_floor: float = 1e-4,    # 데드 채널 방지용 바닥값
+    gain_max: float = 200.0,    # 최대 증폭률 (0.005 -> 1.0 가능)
+    clip: float = 15.0,          # (매우 중요) 증폭된 노이즈를 잘라낼 한계치
 ) -> torch.Tensor:
-    # fp32에서 통계 계산(안정)
     x32 = x.float()
-    # rms = torch.sqrt(torch.mean(x32 * x32, dim=(1,2), keepdim=True) + 1e-8)  # (B,1,1)
-    rms = torch.sqrt(torch.mean(x32 * x32, dim=-1, keepdim=True) + 1e-8)  # (B,C,1)
-
-    # rms가 너무 작은 것만 보정
-    need = (rms < rms_low).to(x32.dtype)  # (B,1,1) 0/1
-    gain = (target_rms / rms.clamp_min(rms_floor)).clamp(1.0 / gain_max, gain_max)
-
-    # need==1인 샘플만 스케일 적용
-    x32 = x32 * (1.0 + need * (gain - 1.0))
-
+    
+    # 1. 노이즈 스파이크를 무시하는 Robust Amplitude 계산
+    # 절대값을 씌운 뒤 90% 위치의 값을 찾음 (거대한 스파이크는 상위 10%에 속하므로 무시됨)
+    robust_amp = torch.quantile(x32.abs(), q=quantile, dim=-1, keepdim=True) # (B,C,1)
+    
+    # 2. Gain 계산 (눌려버린 뇌파를 target_amp 수준으로 끌어올림)
+    gain = (target_amp / robust_amp.clamp_min(amp_floor)).clamp(max=gain_max)
+    
+    # 3. 스케일 적용
+    x32 = x32 * gain
+    
     if clip and clip > 0:
         x32 = x32.clamp(-clip, clip)
-
+        
     return x32.to(dtype=x.dtype)
-
 
 def gather_channel_embeddings(x: torch.Tensor, c_idx: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
     """
@@ -1116,7 +1146,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     )
 
     # accelerate prepare
-    student, teacher, predictor, opt, loader = accelerator.prepare(student, teacher, predictor, opt, loader)
+    student, predictor, opt, loader = accelerator.prepare(student, predictor, opt, loader)
     if spec_align_heads is not None:
         spec_align_heads = accelerator.prepare(spec_align_heads)
     if rel_z_projector is not None:
@@ -1131,8 +1161,10 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
             p.requires_grad = False
         teacher.eval()
 
+    dev = accelerator.device
+    teacher.to(dev)
+
     student_raw = accelerator.unwrap_model(student)
-    teacher_raw = accelerator.unwrap_model(teacher)
     predictor_raw = accelerator.unwrap_model(predictor)
 
     # freq bin centers for masking
@@ -1140,6 +1172,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     student.train()
     predictor.train()
     teacher.eval()
+    ema_updater = EMAUpdater(teacher, student_raw, train_cfg.ema_momentum)
 
     # ---------------------------------
     # accumulation state
@@ -1218,7 +1251,6 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         else 0
     )
 
-    dev = accelerator.device
 
     pbar = tqdm(total=train_cfg.max_steps, disable=not accelerator.is_local_main_process)
     if resume_state_dir and int(global_step) >= int(train_cfg.max_steps):
@@ -1297,15 +1329,19 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
             batches_seen_in_pass = 1
 
         x = batch["eeg"].to(dev, non_blocking=True)          # (B,C,T)
+        B = x.shape[0]
+        C_max = batch["C_max_cpu"]
+        P_max = batch["P_max_cpu"]
         coords = batch["coord"].to(dev, non_blocking=True)   # (B,C,3)
         n_channels = batch["n_channels"].to(dev, non_blocking=True)
         n_patches = batch["n_patches"].to(dev, non_blocking=True)
-        target_mask = batch.get("target_mask", None)
-        if target_mask is not None:
-            target_mask = target_mask.to(dev, non_blocking=True)
-        B, C_max, _ = x.shape
-        # P_max = int(n_patches.max().item())
-        P_max = int(batch["n_patches"][0].item())
+        if "target_mask" in batch:
+            target_mask = batch["target_mask"].to(dev, non_blocking=True)
+            context_mask = batch["context_mask"].to(dev, non_blocking=True)
+        else:
+            target_mask = batch.get("target_mask", None)
+            if target_mask is not None:
+                target_mask = target_mask.to(dev, non_blocking=True)
         x = rescale_small_segments(x, target_rms=1.0, rms_low=0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
 
         # valid token mask (B,C,P)
@@ -1350,11 +1386,11 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         if manual_accum:
             if use_token_budget:
                 if accum_basis == "valid":
-                    tokens_this = int(B) * int(x.shape[1]) * int(P_max)
+                    tokens_this = int(batch["valid_tokens"]) if "valid_tokens" in batch else int(valid.sum().item())
                 elif accum_basis == "context":
-                    tokens_this = int(context_mask.sum().item())
-                else:  # default: "target"
-                    tokens_this = int(target_mask.sum().item())
+                    tokens_this = int(batch["context_tokens"]) if "context_tokens" in batch else int(context_mask.sum().item())
+                else:  # target
+                    tokens_this = int(batch["target_tokens"]) if "target_tokens" in batch else int(target_mask.sum().item())
             else:
                 tokens_this = 1
         else:
@@ -1420,8 +1456,16 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                 freq_mask_bins = None
 
             # 4) pack indices
-            c_ctx, t_ctx, pad_ctx = mask_to_packed_indices(context_mask, valid)
-            c_tgt, t_tgt, pad_tgt = mask_to_packed_indices(target_mask, valid)
+            if "c_ctx" in batch:
+                c_ctx = batch["c_ctx"].to(dev, non_blocking=True)
+                t_ctx = batch["t_ctx"].to(dev, non_blocking=True)
+                pad_ctx = batch["pad_ctx"].to(dev, non_blocking=True)
+                c_tgt = batch["c_tgt"].to(dev, non_blocking=True)
+                t_tgt = batch["t_tgt"].to(dev, non_blocking=True)
+                pad_tgt = batch["pad_tgt"].to(dev, non_blocking=True)
+            else:
+                c_ctx, t_ctx, pad_ctx = mask_to_packed_indices(context_mask, valid)
+                c_tgt, t_tgt, pad_tgt = mask_to_packed_indices(target_mask, valid)
 
             with accelerator.autocast():
                 # 5) student: embed+encode context only
@@ -1438,12 +1482,12 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                 )
                 # NOTE: embed_from_indices is called on the unwrapped module to avoid DDP wrapper issues
                 # around the unfold/view path. The wrapped model still handles the main encoder forward.
-                z_ctx = student(tok_ctx, padding_mask=pad_ctx, rope_pos=rope_ctx, chan_idx=chan_ctx, coords=coords, grid_pathes=P_max)  # (B,Lc,D)
+                z_ctx = student(tok_ctx, padding_mask=pad_ctx, rope_pos=rope_ctx, chan_idx=chan_ctx, coords=coords, grid_patches=P_max)  # (B,Lc,D)
 
                 # 6) teacher: embed+encode targets only (no corruption)
                 with torch.no_grad():
-                    coord_ch_teacher = teacher_raw.coord_embed(coords)  # (B,C,D)
-                    tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher_raw.embed_from_indices(
+                    coord_ch_teacher = teacher.coord_embed(coords)  # (B,C,D)
+                    tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher.embed_from_indices(
                         x=x,
                         coords=coords,
                         c_idx=c_tgt,
@@ -1736,8 +1780,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
             if lr_sched == "token_wcc":
                 tokens_seen_total = int(tokens_seen_total) + int(accum_tokens_eff)
 
-            m = ema_momentum_schedule(global_step, ema_total_steps, train_cfg.ema_momentum, train_cfg.ema_momentum_final)
-            update_ema(teacher=teacher_raw, student=student_raw, m=m)
+            ema_updater.ema_momentum_schedule(global_step, ema_total_steps, train_cfg.ema_momentum, train_cfg.ema_momentum_final)
+            ema_updater.update_ema()
 
             if accelerator.is_main_process and (global_step % train_cfg.log_every == 0):
                 # bucket key (shape) for this micro-batch (ShapeBatcher guarantees same (C,P) inside micro-batch)
@@ -1766,7 +1810,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                     "loss_scaled": float(loss_scaled.detach().cpu().item()),
                     "lr": lr,
                     "tokens_seen_total": int(tokens_seen_total) if lr_sched == "token_wcc" else 0,
-                    "ema_m": m,
+                    "ema_m": ema_updater.m,
                     "grad_norm": float(grad_norm.detach().cpu().item()) if grad_norm is not None else 0.0,
                     "vicreg_loss": float((vic_loss_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
                     "vicreg_var": float((vic_var_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
@@ -1832,7 +1876,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                 if accelerator.is_main_process:
                     student_raw.save_pretrained(os.path.join(ckpt_dir, f"student_{global_step+1:07d}"))
                     torch.save(predictor_raw.state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step+1:07d}.pt"))
-                    teacher_raw.save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step+1:07d}"))
+                    teacher.save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step+1:07d}"))
 
                     _save_trainer_state(
                         os.path.join(ckpt_dir, "trainer_state.json"),
@@ -1891,7 +1935,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         os.makedirs(final_dir, exist_ok=True)
         student_raw.save_pretrained(os.path.join(final_dir, "student"))
         torch.save(predictor_raw.state_dict(), os.path.join(final_dir, "predictor.pt"))
-        teacher_raw.save_pretrained(os.path.join(final_dir, "teacher"))
+        teacher.save_pretrained(os.path.join(final_dir, "teacher"))
         _save_trainer_state(
             os.path.join(final_dir, "trainer_state.json"),
             global_step_next=global_step,

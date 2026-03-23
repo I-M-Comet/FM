@@ -654,7 +654,7 @@ class MultiheadSelfAttentionRoPE(nn.Module):
             q_sp = q_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
             k_sp = k_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
 
-            scale = q.new_tensor(self.spatial_qk_scale)
+            scale = self.spatial_qk_scale
             q = q + scale * q_sp
             k = k + scale * k_sp
 
@@ -662,19 +662,27 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         if self.qk_norm != "off":
             eps = self.qk_norm_eps
             if self.qk_norm == "l2":
-                q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
-                k_norm = k.to(torch.float32).norm(dim=-1, keepdim=True)
-                q = q / (q_norm.to(q.dtype) + eps)
-                k = k / (k_norm.to(k.dtype) + eps)
-                # compensate SDP's internal 1/sqrt(d) scaling (so logits stay O(1))
+                # q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
+                # k_norm = k.to(torch.float32).norm(dim=-1, keepdim=True)
+                # 내부적으로 float32 연산 수행 후 복사 없이 반환
+                q_norm = torch.linalg.vector_norm(q, dim=-1, keepdim=True, dtype=torch.float32)
+                k_norm = torch.linalg.vector_norm(k, dim=-1, keepdim=True, dtype=torch.float32)
                 scale = math.sqrt(self.head_dim)
-                q = q * scale
-                k = k * scale
+                # q = q / (q_norm.to(q.dtype) + eps)
+                # k = k / (k_norm.to(k.dtype) + eps)
+                # q = q * scale
+                # k = k * scale
+                # 계산을 먼저 하고 마지막에 원래 dtype으로 캐스팅
+                q = (q / (q_norm + eps) * scale).to(q.dtype)
+                k = (k / (k_norm + eps) * scale).to(k.dtype)
             elif self.qk_norm in ("rms", "rmsnorm"):
-                q_rms = q.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-                k_rms = k.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-                q = (q * torch.rsqrt(q_rms + eps).to(q.dtype)) * self.q_norm_weight
-                k = (k * torch.rsqrt(k_rms + eps).to(k.dtype)) * self.k_norm_weight
+                # q_dtype = q.dtype
+                # k_dtype = k.dtype
+                # q = F.rms_norm(q.float(), (self.head_dim,), weight=self.q_norm_weight, eps=eps).to(dtype=q_dtype)
+                # k = F.rms_norm(k.float(), (self.head_dim,), weight=self.k_norm_weight, eps=eps).to(dtype=k_dtype)
+                # 명시적 .float() 캐스팅 제거 (AMP에서 F.rms_norm이 알아서 처리)
+                q = F.rms_norm(q, (self.head_dim,), weight=self.q_norm_weight, eps=eps)
+                k = F.rms_norm(k, (self.head_dim,), weight=self.k_norm_weight, eps=eps)
             elif self.qk_norm in ("layernorm", "ln"):
                 q = F.layer_norm(q, (self.head_dim,), weight=self.q_norm_weight, bias=self.q_norm_bias, eps=eps)
                 k = F.layer_norm(k, (self.head_dim,), weight=self.k_norm_weight, bias=self.k_norm_bias, eps=eps)
@@ -816,19 +824,27 @@ class CrossAttentionRoPE(nn.Module):
         if self.qk_norm != "off":
             eps = self.qk_norm_eps
             if self.qk_norm == "l2":
-                q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
-                k_norm = k.to(torch.float32).norm(dim=-1, keepdim=True)
-                q = q / (q_norm.to(q.dtype) + eps)
-                k = k / (k_norm.to(k.dtype) + eps)
-                # compensate SDP's internal 1/sqrt(d) scaling (so logits stay O(1))
+                # q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
+                # k_norm = k.to(torch.float32).norm(dim=-1, keepdim=True)
+                # 내부적으로 float32 연산 수행 후 복사 없이 반환
+                q_norm = torch.linalg.vector_norm(q, dim=-1, keepdim=True, dtype=torch.float32)
+                k_norm = torch.linalg.vector_norm(k, dim=-1, keepdim=True, dtype=torch.float32)
                 scale = math.sqrt(self.head_dim)
-                q = q * scale
-                k = k * scale
+                # q = q / (q_norm.to(q.dtype) + eps)
+                # k = k / (k_norm.to(k.dtype) + eps)
+                # q = q * scale
+                # k = k * scale
+                # 계산을 먼저 하고 마지막에 원래 dtype으로 캐스팅
+                q = (q / (q_norm + eps) * scale).to(q.dtype)
+                k = (k / (k_norm + eps) * scale).to(k.dtype)
             elif self.qk_norm in ("rms", "rmsnorm"):
-                q_rms = q.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-                k_rms = k.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-                q = (q * torch.rsqrt(q_rms + eps).to(q.dtype)) * self.q_norm_weight
-                k = (k * torch.rsqrt(k_rms + eps).to(k.dtype)) * self.k_norm_weight
+                # q_dtype = q.dtype
+                # k_dtype = k.dtype
+                # q = F.rms_norm(q.float(), (self.head_dim,), weight=self.q_norm_weight, eps=eps).to(dtype=q_dtype)
+                # k = F.rms_norm(k.float(), (self.head_dim,), weight=self.k_norm_weight, eps=eps).to(dtype=k_dtype)
+                # 명시적 .float() 캐스팅 제거 (AMP에서 F.rms_norm이 알아서 처리)
+                q = F.rms_norm(q, (self.head_dim,), weight=self.q_norm_weight, eps=eps)
+                k = F.rms_norm(k, (self.head_dim,), weight=self.k_norm_weight, eps=eps)
             elif self.qk_norm in ("layernorm", "ln"):
                 q = F.layer_norm(q, (self.head_dim,), weight=self.q_norm_weight, bias=self.q_norm_bias, eps=eps)
                 k = F.layer_norm(k, (self.head_dim,), weight=self.k_norm_weight, bias=self.k_norm_bias, eps=eps)
@@ -1161,19 +1177,16 @@ class DividedSpatiotemporalBlock(nn.Module):
         """
         B, L, D = x.shape
         device = x.device
+        grid = x.new_zeros((B, C, P + 1, D))
+        grid_pad = torch.ones((B, C, P + 1), dtype=torch.bool, device=device)
 
-        grid = x.new_zeros((B, C, P, D))
-        grid_pad = torch.ones((B, C, P), dtype=torch.bool, device=device)
+        b = b_rows.expand(B, L)
+        trash = torch.full_like(t_idx, P)
+        t_safe = torch.where(pad, trash, t_idx)
 
-        valid = ~pad
-        b = b_rows.expand(B, L)[valid]
-        cc = c_idx[valid]
-        tt = t_idx[valid]
-        xv = x[valid]
-
-        grid[b, cc, tt] = xv
-        grid_pad[b, cc, tt] = False
-        return grid, grid_pad
+        grid[b, c_idx, t_safe] = x
+        grid_pad[b, c_idx, t_safe] = pad
+        return grid[:, :, :P, :], grid_pad[:, :, :P]
 
     def _gather_from_grid(
         self,

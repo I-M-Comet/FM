@@ -394,6 +394,7 @@ def sample_jepa_target_mask_same_shape_style3_cpu(
     time_ratio_range: Tuple[float, float],
     spatial_ratio_range: Tuple[float, float],
     dilate_time: int = 0,
+    **kwargs
 ) -> torch.Tensor:
     """
     Fast worker-side path for current train setup:
