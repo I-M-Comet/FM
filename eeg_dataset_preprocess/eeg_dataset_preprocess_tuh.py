@@ -42,9 +42,9 @@ from tqdm import tqdm
 CONFIG = {
     # 경로
     "ROOT_DIR": "/media/hdd3/tuh",
-    "OUTPUT_PATTERN": "/media/hdd3/tuh_preprocessed/tuh-%06d.tar",
-    "PROGRESS_FILE": "/media/hdd3/tuh_preprocessed/.progress.jsonl",   # 완료 기록
-    "LOG_FILE": "/media/hdd3/tuh_preprocessed/preprocess.log",
+    "OUTPUT_PATTERN": "/media/hdd1/tuh_preprocessed/tuh-%06d.tar",
+    "PROGRESS_FILE": "/media/hdd1/tuh_preprocessed/.progress.jsonl",   # 완료 기록
+    "LOG_FILE": "/media/hdd1/tuh_preprocessed/preprocess.log",
 
     # 몽타주
     "MONTAGE": "standard_1005",
