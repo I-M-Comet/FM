@@ -37,6 +37,8 @@ try:
 except Exception:
     Accelerator = None
 
+_logspec_window_cache = {}
+
 @torch.no_grad()
 def compute_logspec_view(
     patches: torch.Tensor,   # (N, S) float32
@@ -55,6 +57,11 @@ def compute_logspec_view(
     x = x - x.mean(dim=-1, keepdim=True)
 
     if use_hann:
+        cache_key = (x.shape[-1], x.device, x.dtype)
+        if cache_key not in _logspec_window_cache:
+            _logspec_window_cache[cache_key] = torch.hann_window(
+                x.shape[-1], periodic=True, device=x.device, dtype=x.dtype
+            )
         win = torch.hann_window(x.shape[-1], device=x.device, dtype=x.dtype)
         x = x * win[None, :]
 
@@ -63,7 +70,6 @@ def compute_logspec_view(
 
     freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / float(fs)).to(device=x.device, dtype=torch.float32)
     sel = (freqs >= float(f_min)) & (freqs <= float(f_max))
-
     logp = torch.log(P[:, sel])  # (N, Fsel)
 
     # dataset / gain / notch 영향 조금 줄이기
@@ -105,9 +111,22 @@ def relational_kl_loss(z: torch.Tensor, s: torch.Tensor, tau_z: float = 0.1, tau
     assert z.dim() == 2 and s.dim() == 2, f"z,s must be 2D, got {z.shape}, {s.shape}"
     assert int(z.shape[0]) == int(s.shape[0]), f"M mismatch: {z.shape[0]} vs {s.shape[0]}"
 
-    log_p = F.log_softmax(pairwise_logits_no_diag(z, tau=tau_z), dim=-1)
-    q = F.softmax(pairwise_logits_no_diag(s, tau=tau_s), dim=-1).detach()
-    return F.kl_div(log_p, q, reduction="batchmean")
+    M = z.shape[0]
+    z_n = F.normalize(z, dim=-1)
+    s_n = F.normalize(s, dim=-1)
+
+    logits_z = (z_n @ z_n.T) / tau_z
+    logits_s = (s_n @ s_n.T) / tau_s
+
+    diag = torch.arange(M, device=z.device)
+    logits_z[diag, diag] = float("-inf")
+    logits_s[diag, diag] = float("-inf")
+
+    log_p = F.log_softmax(logits_z, dim=-1)
+    log_q = F.log_softmax(logits_s, dim=-1).detach()
+
+    loss = F.kl_div(log_p, log_q, reduction="batchmean", log_target=True)
+    return loss
 
 
 # =========================
@@ -476,6 +495,10 @@ def vicreg_var_cov_loss(
 
 class EMAUpdater:
     def __init__(self, teacher: torch.nn.Module, student: torch.nn.Module, m0: float):
+        if hasattr(teacher, "_orig_mod"):
+            teacher = teacher._orig_mod
+        if hasattr(student, "_orig_mod"):
+            student = student._orig_mod
         self.teacher_params = list(teacher.parameters())
         self.student_params = list(student.parameters())
         self.m = m0
@@ -569,20 +592,18 @@ def rescale_small_segments(
     clip: float = 15.0,          # (매우 중요) 증폭된 노이즈를 잘라낼 한계치
 ) -> torch.Tensor:
     x32 = x.float()
-    
-    # 1. 노이즈 스파이크를 무시하는 Robust Amplitude 계산
-    # 절대값을 씌운 뒤 90% 위치의 값을 찾음 (거대한 스파이크는 상위 10%에 속하므로 무시됨)
-    robust_amp = torch.quantile(x32.abs(), q=quantile, dim=-1, keepdim=True) # (B,C,1)
-    
-    # 2. Gain 계산 (눌려버린 뇌파를 target_amp 수준으로 끌어올림)
+    T = x32.shape[-1]
+
+    # kthvalue: introselect 기반 O(T) average — sort 대비 훨씬 빠름
+    k_idx = max(1, int(round(quantile * T)))  # 90th percentile → 0.9*T 번째로 작은 값
+    robust_amp = x32.abs().kthvalue(k_idx, dim=-1, keepdim=True).values  # (B,C,1)
+
     gain = (target_amp / robust_amp.clamp_min(amp_floor)).clamp(max=gain_max)
-    
-    # 3. 스케일 적용
     x32 = x32 * gain
-    
+
     if clip and clip > 0:
         x32 = x32.clamp(-clip, clip)
-        
+
     return x32.to(dtype=x.dtype)
 
 def gather_channel_embeddings(x: torch.Tensor, c_idx: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
@@ -1166,6 +1187,21 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
 
     student_raw = accelerator.unwrap_model(student)
     predictor_raw = accelerator.unwrap_model(predictor)
+        
+    # ★ torch.compile — teacher deepcopy 이후, accelerator.prepare 이전
+    for blk in student_raw.blocks:
+        if hasattr(blk, 'attn'):
+            blk.attn = torch.compile(blk.attn, mode="default", dynamic=True)
+        if hasattr(blk, 'attn_t'):
+            blk.attn_t = torch.compile(blk.attn_t, mode="default", dynamic=True)
+        if hasattr(blk, 'attn_s'):
+            blk.attn_s = torch.compile(blk.attn_s, mode="default", dynamic=True)
+        if hasattr(blk, 'mlp'):
+            blk.mlp = torch.compile(blk.mlp, mode="default", dynamic=True)
+
+    for blk in predictor_raw.blocks:
+        blk.xattn = torch.compile(blk.xattn, mode="default", dynamic=True)
+        blk.mlp = torch.compile(blk.mlp, mode="default", dynamic=True)
 
     # freq bin centers for masking
     bin_centers = student_raw.freq_feat.bin_centers_hz.detach().cpu()
@@ -1487,6 +1523,13 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                 # 6) teacher: embed+encode targets only (no corruption)
                 with torch.no_grad():
                     coord_ch_teacher = teacher.coord_embed(coords)  # (B,C,D)
+                    # ★ target 패치를 여기서 한 번만 추출 (spec_rel에서 재사용)
+                    if rel_z_projector is not None:
+                        patches_view_t = teacher.extract_patches_view(x)  # VIEW
+                        c_safe_t = c_tgt.clamp(min=0)
+                        t_safe_t = t_tgt.clamp(min=0)
+                        b_idx_t = torch.arange(B, device=x.device)[:, None].expand(B, c_safe_t.shape[1])
+                        _cached_tgt_patches = patches_view_t[b_idx_t, c_safe_t, t_safe_t]  # (B,Lt,S)
                     tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher.embed_from_indices(
                         x=x,
                         coords=coords,
@@ -1586,16 +1629,9 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
 
                 spec_rel_loss = None
                 if rel_z_projector is not None:
-                    # target patches -> fixed raw log-spectrum
-                    patches_view = student_raw.extract_patches_view(x)
-                    c_safe = c_tgt.clamp(min=0)
-                    t_safe = t_tgt.clamp(min=0)
-                    B_, Lt = c_safe.shape
-                    b_idx = torch.arange(B_, device=x.device)[:, None].expand(B_, Lt)
-                    patches_tgt = patches_view[b_idx, c_safe, t_safe]
                     valid_tgt = ~pad_tgt
 
-                    patches_flat = patches_tgt[valid_tgt].to(torch.float32)
+                    patches_flat = _cached_tgt_patches[valid_tgt].to(torch.float32)
                     spec_target = compute_logspec_view(
                         patches_flat,
                         fs=model_cfg.sample_rate,
@@ -1805,20 +1841,29 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                     spec_loss = 0.0
                     spec_lam = 0.0
 
+                log_tensors = torch.stack([
+                    loss_log.detach().float(),
+                    loss_scaled.detach().float(),
+                    grad_norm.detach().float() if grad_norm is not None else torch.zeros((), device=dev),
+                    (~pad_ctx).sum().float(),
+                    (~pad_tgt).sum().float(),
+                    (~pad_ctx).sum(dim=1).max().float(),
+                    (~pad_tgt).sum(dim=1).max().float(),
+                ]).cpu()  # 단일 D2H copy
                 logs = {
-                    "loss_tgt_mean": float(loss_log.detach().cpu().item()),
-                    "loss_scaled": float(loss_scaled.detach().cpu().item()),
+                    "loss_tgt_mean": float(log_tensors[0]),
+                    "loss_scaled": float(log_tensors[1]),
                     "lr": lr,
                     "tokens_seen_total": int(tokens_seen_total) if lr_sched == "token_wcc" else 0,
                     "ema_m": ema_updater.m,
-                    "grad_norm": float(grad_norm.detach().cpu().item()) if grad_norm is not None else 0.0,
+                    "grad_norm": float(log_tensors[2]),
                     "vicreg_loss": float((vic_loss_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
                     "vicreg_var": float((vic_var_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
                     "vicreg_cov": float((vic_cov_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
-                    "ctx_tokens_max": int((~pad_ctx).sum(dim=1).max().detach().cpu().item()),
-                    "tgt_tokens_max": int((~pad_tgt).sum(dim=1).max().detach().cpu().item()),
-                    "ctx_tokens_sum": int((~pad_ctx).sum().detach().cpu().item()),
-                    "tgt_tokens_sum": int((~pad_tgt).sum().detach().cpu().item()),
+                    "ctx_tokens_max": int(log_tensors[5]),
+                    "tgt_tokens_max": int(log_tensors[6]),
+                    "ctx_tokens_sum": int(log_tensors[3]),
+                    "tgt_tokens_sum": int(log_tensors[4]),
                     "batch_size_samples": int(B),
                     "bucket_C": bucket_C,
                     "bucket_P": bucket_P,

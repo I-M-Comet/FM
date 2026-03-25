@@ -12,6 +12,40 @@ import torch.nn.functional as F
 
 from .config import EEGModelConfig
 
+from contextlib import nullcontext
+import warnings
+
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+except Exception:
+    sdpa_kernel = None
+    SDPBackend = None
+
+try:
+    from torch.backends.cuda import (
+        SDPAParams,
+        can_use_flash_attention,
+        can_use_efficient_attention,
+        can_use_cudnn_attention,
+    )
+except Exception:
+    SDPAParams = None
+    can_use_flash_attention = None
+    can_use_efficient_attention = None
+    can_use_cudnn_attention = None
+
+def enable_sdpa_debug(model, force_backend="flash", debug_once=False):
+    for i, blk in enumerate(model.blocks):
+        if isinstance(blk, FullAttentionBlock):
+            blk.attn.sdpa_label = f"blocks.{i}.full"
+        elif isinstance(blk, DividedSpatiotemporalBlock):
+            blk.attn_t.sdpa_label = f"blocks.{i}.divided.temporal"
+            blk.attn_s.sdpa_label = f"blocks.{i}.divided.spatial"
+    for m in model.modules():
+        if isinstance(m, MultiheadSelfAttentionRoPE):
+            m.sdpa_debug = True
+            m.sdpa_debug_once = debug_once
+            m.sdpa_force_backend = force_backend  # "", "flash", "efficient", "math"
 
 def _gather_channel_features(x_ch: torch.Tensor, c_idx: torch.Tensor) -> torch.Tensor:
     """
@@ -52,7 +86,7 @@ class LegendreAnchorFeatures(nn.Module):
         self.coeff = nn.Parameter(torch.zeros(self.num_anchors, self.degree + 1))
 
         self.proj = nn.Linear(self.num_anchors, self.out_dim, bias=False)
-        self.norm = make_norm(cfg.norm_type, self.out_dim, eps=1e-6)
+        self.norm = nn.LayerNorm(self.out_dim)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         """
@@ -98,7 +132,7 @@ class LayerSpecAlignHeads(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([
             nn.Sequential(
-                make_norm("ln", d_model, eps=1e-6), #rms
+                make_norm("rms", d_model, eps=1e-6),
                 nn.Linear(d_model, spec_dim),
             )
             for _ in range(n_layers)
@@ -114,7 +148,7 @@ class Z_Projector(nn.Module):
     def __init__(self, d_model: int, spec_dim: int):
         super().__init__()
         self.heads = nn.Sequential(
-            make_norm("ln", d_model, eps=1e-6), #rms
+            make_norm("rms", d_model, eps=1e-6),
             nn.Linear(d_model, spec_dim),
         )
 
@@ -154,21 +188,28 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
       - (N, half) OR
       - (B, N, half)
     """
-    assert x.shape[-1] % 2 == 0
-    if cos.dim() == 2:
-        cos = cos[None, None, :, :]
-        sin = sin[None, None, :, :]
-    elif cos.dim() == 3:
-        cos = cos[:, None, :, :]
-        sin = sin[:, None, :, :]
+    B, H, N, D = x.shape
+    assert D % 2 == 0
+    half = D // 2
 
     x1 = x[..., 0::2]
     x2 = x[..., 1::2]
 
-    out = torch.empty_like(x)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out
+    if cos.dim() == 2:
+        # (N,half) -> (1,1,N,half)
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+    elif cos.dim() == 3:
+        # (B,N,half) -> (B,1,N,half)
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
+    else:
+        raise ValueError(f"cos dim must be 2 or 3, got {cos.dim()}")
+
+    y1 = x1 * cos - x2 * sin
+    y2 = x1 * sin + x2 * cos
+    y = torch.stack([y1, y2], dim=-1).flatten(-2)
+    return y
 
 
 # ============================================================
@@ -514,7 +555,6 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         spatial_qk: str = "none",
         spatial_qk_dim: int = 0, 
         spatial_qk_scale: float = 1.0,
-        max_seq_len:int = 4096
     ):
         super().__init__()
         assert d_model % n_heads == 0
@@ -538,19 +578,11 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         rotary_dim = rotary_dim - (rotary_dim % 2)
         self.rotary_dim = max(0, rotary_dim)
         self.rope_theta = float(rope_theta)
-        if self.rotary_dim > 0:
-            cos, sin = build_rope_cache(
-                max_pos=max_seq_len,
-                rotary_dim=self.rotary_dim,
-                theta=self.rope_theta,
-                device=torch.device("cpu"),
-                dtype=torch.float32,
-            )
-            self.register_buffer("_rope_cos", cos, persistent=False)
-            self.register_buffer("_rope_sin", sin, persistent=False)
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
         self.out = nn.Linear(d_model, d_model, bias=True)
+
+        self._rope_cache = None  # (cos, sin, max_pos, dtype, device)
 
         self.spatial_qk_dim = int(spatial_qk_dim)
         self.spatial_qk_scale = float(spatial_qk_scale)
@@ -560,28 +592,177 @@ class MultiheadSelfAttentionRoPE(nn.Module):
             self.spatial_k_proj = nn.Linear(self.spatial_qk_dim, d_model, bias=False)
         else:
             self.spatial_q_proj = None
-            self.spatial_k_proj = None
+            self.spatial_k_proj = None        
 
+        self.qk_l2_scale = self.head_dim ** 0.5
+
+        # runtime debug switches
+        self.sdpa_debug = False
+        self.sdpa_debug_once = True
+        self.sdpa_force_backend = ""   # "", "flash", "efficient", "math", "cudnn"
+        self.sdpa_label = ""
+        self._sdpa_debug_seen = False
+
+    @staticmethod
+    def _drop_trivial_padding_mask(padding_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if padding_mask is None:
+            return None
+        if padding_mask.dtype != torch.bool:
+            padding_mask = padding_mask.to(dtype=torch.bool)
+        if padding_mask.numel() == 0:
+            return None
+        # all-False mask는 굳이 SDPA에 넘기지 않는다.
+        if not bool(padding_mask.any().item()):
+            return None
+        return padding_mask
+
+    def _build_sdpa_attn_mask(
+        self,
+        q: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        attn_bias: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        padding_mask = self._drop_trivial_padding_mask(padding_mask)
+
+        if attn_bias is None:
+            if padding_mask is None:
+                return None, None
+            # bool keep-mask
+            return (~padding_mask)[:, None, None, :], padding_mask
+
+        if attn_bias.dim() == 3:
+            attn_mask = attn_bias[:, None, :, :]
+        elif attn_bias.dim() == 4:
+            attn_mask = attn_bias
+        else:
+            raise ValueError(f"attn_bias must have dim 3 or 4, got {attn_bias.shape}")
+
+        if attn_mask.dtype != q.dtype:
+            attn_mask = attn_mask.to(dtype=q.dtype)
+
+        if padding_mask is not None:
+            attn_mask = attn_mask.masked_fill(padding_mask[:, None, None, :], float("-inf"))
+
+        return attn_mask, padding_mask
+
+    def _debug_backend_once(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        dropout_p: float,
+    ) -> None:
+        if not self.sdpa_debug:
+            return
+        if self.sdpa_debug_once and self._sdpa_debug_seen:
+            return
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        label = self.sdpa_label or self.__class__.__name__
+        print(f"\n[SDPA DEBUG] {label}")
+        print(f"  q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}")
+        print(f"  dtype={q.dtype} device={q.device} head_dim={self.head_dim} dropout_p={float(dropout_p)}")
+
+        if attn_mask is None:
+            print("  attn_mask=None")
+        else:
+            msg = f"shape={tuple(attn_mask.shape)} dtype={attn_mask.dtype}"
+            if attn_mask.is_floating_point():
+                finite_ratio = float(torch.isfinite(attn_mask).float().mean().item())
+                msg += f" finite_ratio={finite_ratio:.6f}"
+            print(f"  attn_mask={msg}")
+
+        if (not q.is_cuda) or (SDPAParams is None):
+            print("  CUDA SDPA debug helper unavailable on this device/build.")
+            self._sdpa_debug_seen = True
+            return
+
+        params = SDPAParams(q, k, v, attn_mask, dropout_p, False, False)
+
+        def _run_check(name: str, fn):
+            if fn is None:
+                print(f"  {name}: unavailable")
+                return
+            with warnings.catch_warnings(record=True) as ws:
+                warnings.simplefilter("always")
+                ok = fn(params, debug=True)
+            print(f"  {name}: {ok}")
+            for w in ws:
+                print(f"    - {w.message}")
+
+        _run_check("flash", can_use_flash_attention)
+        _run_check("efficient", can_use_efficient_attention)
+        _run_check("cudnn", can_use_cudnn_attention)
+
+        self._sdpa_debug_seen = True
+
+    def _sdpa_context(self):
+        if (not self.sdpa_force_backend) or (sdpa_kernel is None) or (SDPBackend is None):
+            return nullcontext()
+
+        name = self.sdpa_force_backend.lower().strip()
+        mapping = {
+            "flash": [SDPBackend.FLASH_ATTENTION],
+            "efficient": [SDPBackend.EFFICIENT_ATTENTION],
+            "math": [SDPBackend.MATH],
+        }
+
+        cudnn_backend = getattr(SDPBackend, "CUDNN_ATTENTION", None)
+        if cudnn_backend is not None:
+            mapping["cudnn"] = [cudnn_backend]
+
+        if name not in mapping:
+            raise ValueError(
+                f"Unknown sdpa_force_backend={self.sdpa_force_backend!r}. "
+                f"Use one of: {list(mapping.keys())}"
+            )
+        return sdpa_kernel(mapping[name])
+    
     def _get_rope(
         self,
-        rope_pos: torch.Tensor,
-        dtype: torch.dtype
+        rope_pos: torch.Tensor,   # (N,) or (B,N)
+        dtype: torch.dtype,
+        device: torch.device,
+        max_pos_hint: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        ★ 완전 개작: 동적 rebuild 없음, .item() sync 없음
-        buffer가 model.to(device) 시 자동으로 올바른 device로 이동됨
+        returns cos,sin indexed by positions:
+          - if rope_pos is (N,), returns (N,half)
+          - if rope_pos is (B,N), returns (B,N,half)
         """
-        cos = self._rope_cos.to(dtype=dtype)  # 이미 같은 device
-        sin = self._rope_sin.to(dtype=dtype)
+        if self.rotary_dim == 0:
+            raise RuntimeError("rotary_dim is 0 but _get_rope called")
 
+        max_pos = int(max_pos_hint) if max_pos_hint is not None else (int(rope_pos.max().item()) + 1)
+
+        need_rebuild = True
+        if self._rope_cache is not None:
+            cos, sin, cached_max, cached_dtype, cached_device = self._rope_cache
+            if cached_max >= max_pos and cached_dtype == dtype and cached_device == device:
+                need_rebuild = False
+        if need_rebuild:
+            cos, sin = build_rope_cache(
+                max_pos=max_pos,
+                rotary_dim=self.rotary_dim,
+                theta=self.rope_theta,
+                device=device,
+                dtype=dtype,
+            )
+            self._rope_cache = (cos, sin, max_pos, dtype, device)
+
+        cos, sin, _, _, _ = self._rope_cache
         if rope_pos.dim() == 1:
-            # (N,) → (N, half)
-            return cos[rope_pos], sin[rope_pos]
+            return cos.index_select(0, rope_pos), sin.index_select(0, rope_pos)
         elif rope_pos.dim() == 2:
-            # (B, N) → (B, N, half) — advanced indexing
-            return cos[rope_pos], sin[rope_pos]
+            # rope_pos (B,N) -> gather from (max_pos,half)
+            # Use take_along_dim for speed
+            half = cos.shape[1]
+            cos_g = cos.index_select(0, rope_pos.reshape(-1)).reshape(rope_pos.shape[0], rope_pos.shape[1], half)
+            sin_g = sin.index_select(0, rope_pos.reshape(-1)).reshape(rope_pos.shape[0], rope_pos.shape[1], half)
+            return cos_g, sin_g
         else:
-            raise ValueError(f"rope_pos must be 1D or 2D, got {rope_pos.shape}")
+            raise ValueError(f"rope_pos must be (N,) or (B,N), got {rope_pos.shape}")
 
     def forward(
         self,
@@ -591,6 +772,7 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         attn_bias: Optional[torch.Tensor] = None,          # SDPA용 dense bias
         spatial_q_add: Optional[torch.Tensor] = None,
         spatial_k_add: Optional[torch.Tensor] = None,
+        rope_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
         x: (B, N, D)
@@ -611,30 +793,23 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         if self.rotary_dim > 0:
             if rope_pos is None:
                 raise ValueError("rope_pos must be provided when rotary_dim > 0")
-            cos, sin = self._get_rope(rope_pos, dtype=q.dtype)  # (N,half) or (B,N,half)
-
-            if self.rotary_dim == self.head_dim:
-                q = apply_rope(q, cos, sin)
-                k = apply_rope(k, cos, sin)
-            else:
-                q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
-                k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
-                q_rot = apply_rope(q_rot, cos, sin)
-                k_rot = apply_rope(k_rot, cos, sin)
-                q = torch.cat([q_rot, q_pass], dim=-1)
-                k = torch.cat([k_rot, k_pass], dim=-1)
+            cos, sin = self._get_rope(rope_pos, dtype=q.dtype, device=q.device, max_pos_hint=rope_seq_len)  # (N,half) or (B,N,half)
+            q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
+            k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
+            q_rot = apply_rope(q_rot, cos, sin)
+            k_rot = apply_rope(k_rot, cos, sin)
+            q = torch.cat([q_rot, q_pass], dim=-1)
+            k = torch.cat([k_rot, k_pass], dim=-1)
 
         if (spatial_q_add is not None) or (spatial_k_add is not None):
             if (spatial_q_add is None) or (spatial_k_add is None):
                 raise ValueError("spatial_q_add and spatial_k_add must be provided together")
-            q_sp = spatial_q_add
-            k_sp = spatial_k_add
-            if q_sp.shape != x.shape or k_sp.shape != x.shape:
+            if spatial_q_add.shape != x.shape or spatial_k_add.shape != x.shape:
                 raise ValueError(
                     f"preprojected spatial q/k must have shape {x.shape}, got {q_sp.shape} and {k_sp.shape}"
                 )
-            q_sp = q_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
-            k_sp = k_sp.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+            q_sp = spatial_q_add.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+            k_sp = spatial_k_add.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
 
             scale = self.spatial_qk_scale
             q = q + scale * q_sp
@@ -675,30 +850,26 @@ class MultiheadSelfAttentionRoPE(nn.Module):
             q = q.to(v.dtype)
             k = k.to(v.dtype)
 
-        attn_mask = None
-        if attn_bias is None:
-            # key padding only (efficient)
-            if padding_mask is not None:
-                attn_mask = (~padding_mask)[:, None, None, :]  # (B,1,1,N)
-        else:
-            # additive bias mask (float)
-            if attn_bias.dim() == 3:
-                attn_mask = attn_bias[:, None, :, :]
-            elif attn_bias.dim() == 4:
-                attn_mask = attn_bias
-            else:
-                raise ValueError(f"attn_bias must have dim 3 or 4, got {attn_bias.shape}")
-            if attn_mask.dtype != q.dtype:
-                attn_mask = attn_mask.to(dtype=q.dtype)
-            if padding_mask is not None:
-                attn_mask = attn_mask.masked_fill(padding_mask[:, None, None, :], float("-inf"))
-
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=False,
+        attn_mask, padding_mask = self._build_sdpa_attn_mask(
+            q=q,
+            padding_mask=padding_mask,
+            attn_bias=attn_bias,
         )
+        dropout_p = self.attn_dropout if self.training else 0.0
+        self._debug_backend_once(q, k, v, attn_mask, dropout_p)
+
+        try:
+            with self._sdpa_context():
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=False,
+                )
+        except Exception as e:
+            label = self.sdpa_label or self.__class__.__name__
+            print(f"[SDPA DEBUG] forced backend={self.sdpa_force_backend!r} failed at {label}: {e}")
+            raise
 
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.out(out)
@@ -709,7 +880,7 @@ class CrossAttentionRoPE(nn.Module):
     Cross-attention: queries attend to context keys/values.
     RoPE is applied independently to Q and K using their time positions.
     """
-    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rope_theta: float, rotary_pct: float, qk_norm: str = "off", qk_norm_eps: float = 1e-6, max_seq_len: int = 4096):
+    def __init__(self, d_model: int, n_heads: int, attn_dropout: float, rope_theta: float, rotary_pct: float, qk_norm: str = "off", qk_norm_eps: float = 1e-6):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -732,30 +903,51 @@ class CrossAttentionRoPE(nn.Module):
         rotary_dim = rotary_dim - (rotary_dim % 2)
         self.rotary_dim = max(0, rotary_dim)
         self.rope_theta = float(rope_theta)
-        if self.rotary_dim > 0:
-            cos, sin = build_rope_cache(
-                max_pos=max_seq_len,
-                rotary_dim=self.rotary_dim,
-                theta=self.rope_theta,
-                device=torch.device("cpu"),
-                dtype=torch.float32,
-            )
-            self.register_buffer("_rope_cos", cos, persistent=False)
-            self.register_buffer("_rope_sin", sin, persistent=False)
 
         self.q = nn.Linear(d_model, d_model, bias=True)
         self.kv = nn.Linear(d_model, 2 * d_model, bias=True)
         self.out = nn.Linear(d_model, d_model, bias=True)
 
-    def _get_rope(self, rope_pos, dtype):
-        cos = self._rope_cos.to(dtype=dtype)
-        sin = self._rope_sin.to(dtype=dtype)
+        self._rope_cache = None  # (cos, sin, max_pos, dtype, device)
+
+    def _get_rope(
+        self,
+        rope_pos: torch.Tensor,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_pos_hint: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # shared logic with self-attn; keep minimal
+        if self.rotary_dim == 0:
+            raise RuntimeError("rotary_dim is 0 but _get_rope called")
+
+        max_pos = int(max_pos_hint) if max_pos_hint is not None else (int(rope_pos.max().item()) + 1)
+
+        need_rebuild = True
+        if self._rope_cache is not None:
+            cos, sin, cached_max, cached_dtype, cached_device = self._rope_cache
+            if cached_max >= max_pos and cached_dtype == dtype and cached_device == device:
+                need_rebuild = False
+        if need_rebuild:
+            cos, sin = build_rope_cache(
+                max_pos=max_pos,
+                rotary_dim=self.rotary_dim,
+                theta=self.rope_theta,
+                device=device,
+                dtype=dtype,
+            )
+            self._rope_cache = (cos, sin, max_pos, dtype, device)
+
+        cos, sin, _, _, _ = self._rope_cache
         if rope_pos.dim() == 1:
-            return cos[rope_pos], sin[rope_pos]
+            return cos.index_select(0, rope_pos), sin.index_select(0, rope_pos)
         elif rope_pos.dim() == 2:
-            return cos[rope_pos], sin[rope_pos]
+            half = cos.shape[1]
+            cos_g = cos.index_select(0, rope_pos.reshape(-1)).reshape(rope_pos.shape[0], rope_pos.shape[1], half)
+            sin_g = sin.index_select(0, rope_pos.reshape(-1)).reshape(rope_pos.shape[0], rope_pos.shape[1], half)
+            return cos_g, sin_g
         else:
-            raise ValueError(f"rope_pos must be 1D or 2D, got {rope_pos.shape}")
+            raise ValueError(f"rope_pos must be (N,) or (B,N), got {rope_pos.shape}")
 
     def forward(
         self,
@@ -775,19 +967,15 @@ class CrossAttentionRoPE(nn.Module):
         v = v.view(B, Lk, self.n_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_dim > 0:
-            cos_q, sin_q = self._get_rope(rope_pos_q, dtype=q.dtype)
-            cos_k, sin_k = self._get_rope(rope_pos_k, dtype=q.dtype)
-            
-            if self.rotary_dim == self.head_dim:
-                q = apply_rope(q, cos_q, sin_q)
-                k = apply_rope(k, cos_k, sin_k)
-            else:
-                q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
-                k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
-                q_rot = apply_rope(q_rot, cos_q, sin_q)
-                k_rot = apply_rope(k_rot, cos_k, sin_k)
-                q = torch.cat([q_rot, q_pass], dim=-1)
-                k = torch.cat([k_rot, k_pass], dim=-1)
+            cos_q, sin_q = self._get_rope(rope_pos_q, dtype=q.dtype, device=q.device, max_pos_hint=Lq)
+            cos_k, sin_k = self._get_rope(rope_pos_k, dtype=q.dtype, device=q.device, max_pos_hint=Lk)
+
+            q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
+            k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
+            q_rot = apply_rope(q_rot, cos_q, sin_q)
+            k_rot = apply_rope(k_rot, cos_k, sin_k)
+            q = torch.cat([q_rot, q_pass], dim=-1)
+            k = torch.cat([k_rot, k_pass], dim=-1)
 
         attn_dtype = v.dtype   # 보통 bf16/fp16 유지
         # Optional QK normalization (attention stability)
@@ -838,26 +1026,28 @@ class CrossAttentionRoPE(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, Lq, D)
         return self.out(out)
 
-class LayerNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.bias = nn.Parameter(torch.zeros(dim))
-        self.eps = eps
-        self.normalized_shape = (dim,)
-
+class LayerNorm(nn.LayerNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        x_dtype = x.dtype
+        y = F.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return y.to(x_dtype)
     
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-        self.normalized_shape = (dim,)
-
+class RMSNorm(nn.LayerNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
+        x_dtype = x.dtype
+        y = F.rms_norm(
+            x.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.eps,
+        )
+        return y.to(x_dtype)
 
 def make_norm(norm_type: str, dim: int, eps: float = 1e-6) -> nn.Module:
     norm_type = norm_type.lower()
@@ -956,8 +1146,7 @@ class FullAttentionBlock(nn.Module):
             qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
             spatial_qk=getattr(cfg, "spatial_qk_type", "none"),
             spatial_qk_dim=getattr(cfg, "spatial_qk_feat_dim", 64),
-            spatial_qk_scale=getattr(cfg, "spatial_qk_scale", 1.0),
-            max_seq_len=cfg.max_tokens
+            spatial_qk_scale=getattr(cfg, "spatial_qk_scale", 1.0)
         )
 
         self.norm2 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
@@ -971,6 +1160,106 @@ class FullAttentionBlock(nn.Module):
             self.ls1 = None
             self.ls2 = None
 
+        self.use_bucket_full = bool(getattr(cfg, "use_bucket_full", True))
+        self.bucket_full_exact_bias = bool(getattr(cfg, "bucket_full_exact_bias", False))
+
+    @staticmethod
+    def _build_sample_length_buckets(padding_mask: torch.Tensor):
+        """
+        padding_mask: (B,L) True=PAD
+        returns:
+        buckets[seqlen] = {
+            "flat_idx": [LongTensor(S), ...],   # one per sample
+            "sample_ids": [int, ...],
+        }
+        """
+        B, L = padding_mask.shape
+        lengths = (~padding_mask).sum(dim=1)   # (B,)
+        base = torch.arange(L, device=padding_mask.device, dtype=torch.long)
+
+        buckets = {}
+        for b in range(B):
+            s = int(lengths[b].item())
+            if s <= 0:
+                continue
+            payload = buckets.setdefault(s, {"flat_idx": [], "sample_ids": []})
+            payload["flat_idx"].append(base[:s] + b * L)   # packed valid prefix
+            payload["sample_ids"].append(b)
+        return buckets
+    
+    def _run_bucketed_full_attn(
+        self,
+        x: torch.Tensor,                     # (B,L,D)
+        padding_mask: torch.Tensor,          # (B,L)
+        rope_pos: torch.Tensor,              # (B,L)
+        chan_idx: torch.Tensor,              # (B,L)
+        spatial_bias_cc: Optional[torch.Tensor],   # (B,C,C) or None
+        spatial_qk_ch: Optional[torch.Tensor],     # (B,C,Dq) or None
+        rope_seq_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        B, L, D = x.shape
+        x_flat = x.reshape(B * L, D)
+        out_flat = None
+
+        buckets = self._build_sample_length_buckets(padding_mask)
+        if len(buckets) == 0:
+            return x.new_zeros((B, L, D))
+
+        rope_flat = rope_pos.reshape(B * L)
+        chan_flat = chan_idx.reshape(B * L)
+
+        q_add_flat = None
+        k_add_flat = None
+        if (spatial_qk_ch is not None) and (self.attn.spatial_q_proj is not None):
+            q_sp_ch = self.attn.spatial_q_proj(spatial_qk_ch)   # (B,C,D)
+            k_sp_ch = self.attn.spatial_k_proj(spatial_qk_ch)   # (B,C,D)
+            q_tok = _gather_channel_features(q_sp_ch, chan_idx).masked_fill(padding_mask[..., None], 0.0)
+            k_tok = _gather_channel_features(k_sp_ch, chan_idx).masked_fill(padding_mask[..., None], 0.0)
+            q_add_flat = q_tok.reshape(B * L, D)
+            k_add_flat = k_tok.reshape(B * L, D)
+
+        for seqlen, payload in buckets.items():
+            idx = torch.stack(payload["flat_idx"], dim=0)   # (G,S)
+            G = idx.shape[0]
+
+            xb = x_flat.index_select(0, idx.reshape(-1)).view(G, seqlen, D)
+            ropeb = rope_flat.index_select(0, idx.reshape(-1)).view(G, seqlen)
+
+            q_add = None
+            k_add = None
+            if q_add_flat is not None:
+                q_add = q_add_flat.index_select(0, idx.reshape(-1)).view(G, seqlen, D)
+                k_add = k_add_flat.index_select(0, idx.reshape(-1)).view(G, seqlen, D)
+
+            biasb = None
+            if spatial_bias_cc is not None:
+                # exact semantics, but no longer flash-friendly
+                sample_ids = torch.tensor(payload["sample_ids"], device=x.device, dtype=torch.long)
+                c_sel = chan_flat.index_select(0, idx.reshape(-1)).view(G, seqlen)
+                bias_src = spatial_bias_cc.index_select(0, sample_ids)   # (G,C,C)
+                g = torch.arange(G, device=x.device)[:, None, None]
+                biasb = bias_src[g, c_sel[:, :, None], c_sel[:, None, :]]   # (G,S,S)
+
+            yb = self.attn(
+                xb,
+                padding_mask=None,
+                rope_pos=ropeb,
+                attn_bias=biasb,
+                spatial_q_add=q_add,
+                spatial_k_add=k_add,
+                rope_seq_len=rope_seq_len,
+            )
+
+            if out_flat is None:
+                out_flat = yb.new_zeros((B * L, D))
+
+            out_flat.index_copy_(0, idx.reshape(-1), yb.reshape(-1, D))
+
+        if out_flat is None:
+            out_flat = x.new_zeros((B * L, D))
+
+        return out_flat.view(B, L, D)
+
     def forward(
         self,
         x,
@@ -982,33 +1271,65 @@ class FullAttentionBlock(nn.Module):
         grid_channels: Optional[int] = None,
         grid_patches: Optional[int] = None,
     ):
-        attn_bias = None
-        spatial_q_add = None
-        spatial_k_add = None
+        if padding_mask is None:
+            padding_mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)
 
-        if (spatial_qk_ch is not None) and (chan_idx is not None) and (self.attn.spatial_q_proj is not None):
-            q_sp_ch = self.attn.spatial_q_proj(spatial_qk_ch)  # (B,C,D)
-            k_sp_ch = self.attn.spatial_k_proj(spatial_qk_ch)  # (B,C,D)
-            spatial_q_add = _gather_channel_features(q_sp_ch, chan_idx)
-            spatial_k_add = _gather_channel_features(k_sp_ch, chan_idx)
-            if padding_mask is not None:
-                spatial_q_add = spatial_q_add.masked_fill(padding_mask[..., None], 0.0)
-                spatial_k_add = spatial_k_add.masked_fill(padding_mask[..., None], 0.0)
+        # bucketed full path를 쓸지 결정
+        has_real_pad = bool(padding_mask.any().item())
+        can_bucket = self.use_bucket_full and has_real_pad and (chan_idx is not None)
 
-        if self.use_spatial_bias and (spatial_bias_cc is not None) and (chan_idx is not None):
-            c = chan_idx
-            B, N = c.shape
-            b = torch.arange(B, device=c.device)[:, None, None]
-            attn_bias = spatial_bias_cc[b, c[:, :, None], c[:, None, :]]  # (B,N,N)
+        # flash-friendly path: bias 없음
+        if can_bucket and ((not self.use_spatial_bias) or (spatial_bias_cc is None)):
+            y = self._run_bucketed_full_attn(
+                self.norm1(x),
+                padding_mask=padding_mask,
+                rope_pos=rope_pos,
+                chan_idx=chan_idx,
+                spatial_bias_cc=None,
+                spatial_qk_ch=spatial_qk_ch,
+                rope_seq_len=grid_patches,
+            )
+        # exact semantics with bias, but likely not flash
+        elif can_bucket and self.bucket_full_exact_bias and self.use_spatial_bias and (spatial_bias_cc is not None):
+            y = self._run_bucketed_full_attn(
+                self.norm1(x),
+                padding_mask=padding_mask,
+                rope_pos=rope_pos,
+                chan_idx=chan_idx,
+                spatial_bias_cc=spatial_bias_cc,
+                spatial_qk_ch=spatial_qk_ch,
+                rope_seq_len=grid_patches,
+            )
+        else:
+            attn_bias = None
+            spatial_q_add = None
+            spatial_k_add = None
 
-        y = self.attn(
-            self.norm1(x),
-            padding_mask=padding_mask,
-            rope_pos=rope_pos,
-            attn_bias=attn_bias,
-            spatial_q_add=spatial_q_add,
-            spatial_k_add=spatial_k_add,
-        )
+            if (spatial_qk_ch is not None) and (chan_idx is not None) and (self.attn.spatial_q_proj is not None):
+                q_sp_ch = self.attn.spatial_q_proj(spatial_qk_ch)
+                k_sp_ch = self.attn.spatial_k_proj(spatial_qk_ch)
+                spatial_q_add = _gather_channel_features(q_sp_ch, chan_idx)
+                spatial_k_add = _gather_channel_features(k_sp_ch, chan_idx)
+                if padding_mask is not None:
+                    spatial_q_add = spatial_q_add.masked_fill(padding_mask[..., None], 0.0)
+                    spatial_k_add = spatial_k_add.masked_fill(padding_mask[..., None], 0.0)
+
+            if self.use_spatial_bias and (spatial_bias_cc is not None) and (chan_idx is not None):
+                c = chan_idx
+                B, N = c.shape
+                b = torch.arange(B, device=c.device)[:, None, None]
+                attn_bias = spatial_bias_cc[b, c[:, :, None], c[:, None, :]]
+
+            y = self.attn(
+                self.norm1(x),
+                padding_mask=padding_mask,
+                rope_pos=rope_pos,
+                attn_bias=attn_bias,
+                spatial_q_add=spatial_q_add,
+                spatial_k_add=spatial_k_add,
+                rope_seq_len=grid_patches,
+            )
+
         if self.ls1 is not None:
             y = self.ls1(y)
         x = x + self.dropout(y)
@@ -1048,7 +1369,6 @@ class DividedSpatiotemporalBlock(nn.Module):
             rotary_pct=cfg.rotary_pct,
             qk_norm=getattr(cfg, "attn_qk_norm", "off"),
             qk_norm_eps=getattr(cfg, "attn_qk_norm_eps", 1e-6),
-            max_seq_len=cfg.max_tokens
         )
 
         # spatial pass
@@ -1082,7 +1402,8 @@ class DividedSpatiotemporalBlock(nn.Module):
             self.ls_m = None
 
         self._batch_rows_cache = {}
-        self._temporal_rope_cache = {}
+        self._temporal_rope_cache = {}        
+        self.use_bucket_divided = bool(getattr(cfg, "use_bucket_divided", True))
 
     @staticmethod
     def _device_key(device: torch.device):
@@ -1145,6 +1466,10 @@ class DividedSpatiotemporalBlock(nn.Module):
         out = grid[b_rows.expand(B, L), c, t]
         return out.masked_fill(pad[..., None], 0.0)
 
+    @staticmethod
+    def _mask_grid_output(x: torch.Tensor, grid_pad: torch.Tensor) -> torch.Tensor:
+        return x.masked_fill(grid_pad[..., None], 0.0)
+
     def _temporal_from_grid(
         self,
         grid: torch.Tensor,         # (B,C,P,D)
@@ -1166,6 +1491,7 @@ class DividedSpatiotemporalBlock(nn.Module):
             padding_mask=pad_t_safe,
             rope_pos=rope,
             attn_bias=None,
+            rope_seq_len=P,
         )
         y_t = y_t.masked_fill(all_pad[:, None, None], 0.0)
         return y_t.reshape(B, C, P, D)
@@ -1195,11 +1521,12 @@ class DividedSpatiotemporalBlock(nn.Module):
         spatial_k_add = None
         if spatial_bias_cc is not None:
             bias = spatial_bias_cc[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, C)
-        elif (spatial_qk_ch is not None) and (self.attn_s.spatial_q_proj is not None):
-            q_sp_ch = self.attn_s.spatial_q_proj(spatial_qk_ch)   # (B,C,D)
-            k_sp_ch = self.attn_s.spatial_k_proj(spatial_qk_ch)   # (B,C,D)
-            spatial_q_add = q_sp_ch[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, D)
-            spatial_k_add = k_sp_ch[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, D)
+        else:
+            if (spatial_qk_ch is not None) and (self.attn_s.spatial_q_proj is not None):
+                q_sp_ch = self.attn_s.spatial_q_proj(spatial_qk_ch)   # (B,C,D)
+                k_sp_ch = self.attn_s.spatial_k_proj(spatial_qk_ch)   # (B,C,D)
+                spatial_q_add = q_sp_ch[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, D)
+                spatial_k_add = k_sp_ch[:, None, :, :].expand(-1, P, -1, -1).reshape(B * P, C, D)
 
         y_s = self.attn_s(
             x_s,
@@ -1211,9 +1538,211 @@ class DividedSpatiotemporalBlock(nn.Module):
         )
         y_s = y_s.masked_fill(all_pad[:, None, None], 0.0)
 
-        return y_s.reshape(B, P, C, D).permute(0, 2, 1, 3)
+        grid_tp_out = y_s.reshape(B, P, C, D)
+        return grid_tp_out.permute(0, 2, 1, 3).contiguous()
 
-    def forward(
+    def _valid_token_meta(
+        self,
+        padding_mask: torch.Tensor,
+        chan_idx: torch.Tensor,
+        rope_pos: torch.Tensor,
+    ):
+        B, L = padding_mask.shape
+        b_ids, l_ids = torch.where(~padding_mask)    # valid only
+        flat_ids = b_ids * L + l_ids
+        c_ids = chan_idx[b_ids, l_ids]
+        t_ids = rope_pos[b_ids, l_ids]
+        return b_ids, l_ids, flat_ids, c_ids, t_ids
+
+    @staticmethod
+    def _build_length_buckets(
+        group_keys: torch.Tensor,
+        order_keys: torch.Tensor,
+        flat_ids: torch.Tensor,
+        sort_base: int,
+        aux_ids: Optional[torch.Tensor] = None,
+    ):
+        """
+        group_keys: token이 속한 group id
+        order_keys: group 내부 정렬 기준
+        flat_ids: x.view(B*L, D)에서의 flat index
+        aux_ids: temporal에서는 rope_pos(t_idx), spatial에서는 None
+        """
+        if flat_ids.numel() == 0:
+            return {}
+
+        sort_key = group_keys.to(torch.long) * int(sort_base) + order_keys.to(torch.long)
+        perm = torch.argsort(sort_key)
+
+        group_sorted = group_keys[perm]
+        flat_sorted = flat_ids[perm]
+        aux_sorted = None if aux_ids is None else aux_ids[perm]
+
+        _, counts = torch.unique_consecutive(group_sorted, return_counts=True)
+        starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]], dim=0)
+
+        buckets = {}
+        for start, seqlen in zip(starts.tolist(), counts.tolist()):
+            sl = slice(start, start + seqlen)
+            payload = buckets.setdefault(
+                seqlen,
+                {"flat_idx": [], "aux": [] if aux_sorted is not None else None},
+            )
+            payload["flat_idx"].append(flat_sorted[sl])
+            if aux_sorted is not None:
+                payload["aux"].append(aux_sorted[sl])
+
+        return buckets
+
+    def _run_bucketed_self_attn(
+        self,
+        x: torch.Tensor,      # (B,L,D)
+        buckets,
+        attn: MultiheadSelfAttentionRoPE,
+        rope_seq_len: Optional[int] = None,
+        spatial_q_add_flat: Optional[torch.Tensor] = None,   # (B*L,D)
+        spatial_k_add_flat: Optional[torch.Tensor] = None,   # (B*L,D)
+    ) -> torch.Tensor:
+        B, L, D = x.shape
+        x_flat = x.reshape(B * L, D)
+        out_flat = None
+
+        for seqlen, payload in buckets.items():
+            idx = torch.stack(payload["flat_idx"], dim=0)   # (G,S)
+            G = idx.shape[0]
+
+            xb = x_flat.index_select(0, idx.reshape(-1)).view(G, seqlen, D)
+
+            rope = None
+            if payload["aux"] is not None:
+                rope = torch.stack(payload["aux"], dim=0)   # (G,S)
+
+            q_add = None
+            k_add = None
+            if spatial_q_add_flat is not None:
+                q_add = spatial_q_add_flat.index_select(0, idx.reshape(-1)).view(G, seqlen, D)
+                k_add = spatial_k_add_flat.index_select(0, idx.reshape(-1)).view(G, seqlen, D)
+
+            yb = attn(
+                xb,
+                padding_mask=None,
+                rope_pos=rope,
+                attn_bias=None,
+                spatial_q_add=q_add,
+                spatial_k_add=k_add,
+                rope_seq_len=rope_seq_len,
+            )
+            if out_flat is None:
+                out_flat = yb.new_zeros((B * L, D))
+
+            out_flat.index_copy_(0, idx.reshape(-1), yb.reshape(-1, D))
+
+        if out_flat is None:
+            out_flat = x.new_zeros((B * L, D))
+        return out_flat.view(B, L, D)
+
+    def _temporal_bucketed(
+        self,
+        x: torch.Tensor,
+        padding_mask: torch.Tensor,
+        rope_pos: torch.Tensor,
+        chan_idx: torch.Tensor,
+        C: int,
+        P: int,
+    ) -> torch.Tensor:
+        B, L, D = x.shape
+        b_ids, _, flat_ids, c_ids, t_ids = self._valid_token_meta(
+            padding_mask=padding_mask,
+            chan_idx=chan_idx,
+            rope_pos=rope_pos,
+        )
+
+        if flat_ids.numel() == 0:
+            return x.new_zeros((B, L, D))
+
+        # group = (batch, channel), order = time index
+        group_keys = b_ids.to(torch.long) * int(C) + c_ids.to(torch.long)
+
+        buckets = self._build_length_buckets(
+            group_keys=group_keys,
+            order_keys=t_ids,
+            flat_ids=flat_ids,
+            sort_base=P,
+            aux_ids=t_ids,   # actual rope positions
+        )
+
+        return self._run_bucketed_self_attn(
+            x,
+            buckets=buckets,
+            attn=self.attn_t,
+            rope_seq_len=P,
+        )
+
+    def _spatial_bucketed(
+        self,
+        x: torch.Tensor,
+        padding_mask: torch.Tensor,
+        rope_pos: torch.Tensor,
+        chan_idx: torch.Tensor,
+        spatial_bias_cc: Optional[torch.Tensor],
+        spatial_qk_ch: Optional[torch.Tensor],
+        C: int,
+        P: int,
+    ) -> torch.Tensor:
+        if spatial_bias_cc is not None:
+            raise RuntimeError(
+                "_spatial_bucketed only supports spatial_bias_cc=None. "
+                "If you want flash-friendly spatial attention, use "
+                "spatial_bias_type='none' with spatial_qk_type='legendre_anchor'."
+            )
+
+        B, L, D = x.shape
+        b_ids, _, flat_ids, c_ids, t_ids = self._valid_token_meta(
+            padding_mask=padding_mask,
+            chan_idx=chan_idx,
+            rope_pos=rope_pos,
+        )
+
+        if flat_ids.numel() == 0:
+            return x.new_zeros((B, L, D))
+
+        # group = (batch, time), order = channel index
+        group_keys = b_ids.to(torch.long) * int(P) + t_ids.to(torch.long)
+
+        buckets = self._build_length_buckets(
+            group_keys=group_keys,
+            order_keys=c_ids,
+            flat_ids=flat_ids,
+            sort_base=C,
+            aux_ids=None,
+        )
+
+        spatial_q_add_flat = None
+        spatial_k_add_flat = None
+        if (spatial_qk_ch is not None) and (self.attn_s.spatial_q_proj is not None):
+            q_sp_ch = self.attn_s.spatial_q_proj(spatial_qk_ch)  # (B,C,D)
+            k_sp_ch = self.attn_s.spatial_k_proj(spatial_qk_ch)  # (B,C,D)
+
+            q_sp_tok = _gather_channel_features(q_sp_ch, chan_idx).masked_fill(
+                padding_mask[..., None], 0.0
+            )
+            k_sp_tok = _gather_channel_features(k_sp_ch, chan_idx).masked_fill(
+                padding_mask[..., None], 0.0
+            )
+
+            spatial_q_add_flat = q_sp_tok.reshape(B * L, D)
+            spatial_k_add_flat = k_sp_tok.reshape(B * L, D)
+
+        return self._run_bucketed_self_attn(
+            x,
+            buckets=buckets,
+            attn=self.attn_s,
+            rope_seq_len=None,
+            spatial_q_add_flat=spatial_q_add_flat,
+            spatial_k_add_flat=spatial_k_add_flat,
+        )
+    
+    def _forward_dense_grid(
         self,
         x: torch.Tensor,
         padding_mask: Optional[torch.Tensor],
@@ -1240,42 +1769,129 @@ class DividedSpatiotemporalBlock(nn.Module):
         else:
             C = int(chan_idx.max().item()) + 1
 
-        P = int(grid_patches) if grid_patches is not None else int(rope_pos.max().item()) + 1
+        if grid_patches is not None:
+            P = int(grid_patches)
+        else:
+            P = int(rope_pos.max().item()) + 1
 
         grid, grid_pad = self._scatter_to_grid(x, padding_mask, chan_idx, rope_pos, C=C, P=P, b_rows=b_rows)
 
         # temporal
-        grid_normed = self.norm_t(grid)
-        # RMSNorm이면 pad=0→출력=0이지만, LayerNorm은 bias 때문에 non-zero 가능
-        # → 안전하게 mask 유지 (비용: 전체 masked_fill의 ~1/6)
-        grid_normed = grid_normed.masked_fill(grid_pad[..., None], 0.0)
-        y_t = self._temporal_from_grid(grid_normed, grid_pad, P=P)
+        grid_t_in = self._mask_grid_output(self.norm_t(grid), grid_pad)
+        y_t = self._temporal_from_grid(grid_t_in, grid_pad, P=P)
         if self.ls_t is not None:
             y_t = self.ls_t(y_t)
-        grid = grid + self.dropout(y_t)
-        # ★ y_t 후 mask는 불필요 — attention은 padding_mask로 처리,
-        # 그리고 all_pad masking이 _temporal_from_grid 내부에 이미 있음
+        y_t = self._mask_grid_output(self.dropout(y_t), grid_pad)
+        grid = grid + y_t
 
         # spatial
-        grid_normed = self.norm_s(grid)
-        grid_normed = grid_normed.masked_fill(grid_pad[..., None], 0.0)
-        y_s = self._spatial_from_grid(grid_normed, grid_pad,
-                                       spatial_bias_cc=spatial_bias_cc,
-                                       spatial_qk_ch=spatial_qk_ch, P=P)
+        grid_s_in = self._mask_grid_output(self.norm_s(grid), grid_pad)
+        y_s = self._spatial_from_grid(
+            grid_s_in,
+            grid_pad,
+            spatial_bias_cc=spatial_bias_cc,
+            spatial_qk_ch=spatial_qk_ch,
+            P=P,
+        )
         if self.ls_s is not None:
             y_s = self.ls_s(y_s)
-        grid = grid + self.dropout(y_s)
+        y_s = self._mask_grid_output(self.dropout(y_s), grid_pad)
+        grid = grid + y_s
 
         # mlp
-        grid_normed = self.norm_m(grid)
-        grid_normed = grid_normed.masked_fill(grid_pad[..., None], 0.0)
-        y_m = self.mlp(grid_normed)
+        grid_m_in = self._mask_grid_output(self.norm_m(grid), grid_pad)
+        y_m = self.mlp(grid_m_in)
         if self.ls_m is not None:
             y_m = self.ls_m(y_m)
-        grid = grid + self.dropout(y_m)
+        y_m = self._mask_grid_output(self.dropout(y_m), grid_pad)
+        grid = grid + y_m
 
         return self._gather_from_grid(grid, padding_mask, chan_idx, rope_pos, b_rows=b_rows)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        rope_pos: torch.Tensor,
+        chan_idx: Optional[torch.Tensor],
+        spatial_bias_cc: Optional[torch.Tensor],
+        spatial_qk_ch: Optional[torch.Tensor],
+        grid_channels: Optional[int] = None,
+        grid_patches: Optional[int] = None,
+    ) -> torch.Tensor:
+        if padding_mask is None:
+            padding_mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)
+        if chan_idx is None:
+            raise ValueError("DividedSpatiotemporalBlock requires chan_idx")
 
+        if grid_channels is not None:
+            C = int(grid_channels)
+        elif spatial_bias_cc is not None:
+            C = int(spatial_bias_cc.shape[1])
+        elif spatial_qk_ch is not None:
+            C = int(spatial_qk_ch.shape[1])
+        else:
+            C = int(chan_idx.max().item()) + 1
+
+        if grid_patches is not None:
+            P = int(grid_patches)
+        else:
+            P = int(rope_pos.max().item()) + 1
+
+        # spatial_bias가 있으면 결국 additive attn_bias 경로라서 flash-friendly하지 않다.
+        # 그 경우는 기존 dense-grid path로 fallback.
+        use_bucketed = self.use_bucket_divided and (spatial_bias_cc is None)
+
+        if not use_bucketed:
+            return self._forward_dense_grid(
+                x,
+                padding_mask=padding_mask,
+                rope_pos=rope_pos,
+                chan_idx=chan_idx,
+                spatial_bias_cc=spatial_bias_cc,
+                spatial_qk_ch=spatial_qk_ch,
+                grid_channels=C,
+                grid_patches=P,
+            )
+
+        # temporal pass: (batch, channel)별 packed sequence
+        y_t = self._temporal_bucketed(
+            self.norm_t(x),
+            padding_mask=padding_mask,
+            rope_pos=rope_pos,
+            chan_idx=chan_idx,
+            C=C,
+            P=P,
+        )
+        if self.ls_t is not None:
+            y_t = self.ls_t(y_t)
+        y_t = self.dropout(y_t).masked_fill(padding_mask[..., None], 0.0)
+        x = x + y_t
+
+        # spatial pass: (batch, time)별 packed sequence
+        y_s = self._spatial_bucketed(
+            self.norm_s(x),
+            padding_mask=padding_mask,
+            rope_pos=rope_pos,
+            chan_idx=chan_idx,
+            spatial_bias_cc=None,
+            spatial_qk_ch=spatial_qk_ch,
+            C=C,
+            P=P,
+        )
+        if self.ls_s is not None:
+            y_s = self.ls_s(y_s)
+        y_s = self.dropout(y_s).masked_fill(padding_mask[..., None], 0.0)
+        x = x + y_s
+
+        # mlp
+        y_m = self.mlp(self.norm_m(x))
+        if self.ls_m is not None:
+            y_m = self.ls_m(y_m)
+        y_m = self.dropout(y_m).masked_fill(padding_mask[..., None], 0.0)
+        x = x + y_m
+
+        return x
 
 class EEGEncoder(nn.Module):
     """
