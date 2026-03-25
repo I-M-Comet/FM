@@ -118,12 +118,15 @@ def relational_kl_loss(z: torch.Tensor, s: torch.Tensor, tau_z: float = 0.1, tau
     logits_z = (z_n @ z_n.T) / tau_z
     logits_s = (s_n @ s_n.T) / tau_s
 
-    diag = torch.arange(M, device=z.device)
-    logits_z[diag, diag] = float("-inf")
-    logits_s[diag, diag] = float("-inf")
+    diag_mask = torch.eye(M, device=z.device, dtype=torch.bool)
+    logits_z = logits_z.masked_fill(diag_mask, float("-inf"))
+    logits_s = logits_s.masked_fill(diag_mask, float("-inf"))
 
     log_p = F.log_softmax(logits_z, dim=-1)
     log_q = F.log_softmax(logits_s, dim=-1).detach()
+
+    log_p = log_p.masked_fill(diag_mask, 0.0)
+    log_q = log_q.masked_fill(diag_mask, 0.0)
 
     loss = F.kl_div(log_p, log_q, reduction="batchmean", log_target=True)
     return loss
@@ -590,6 +593,7 @@ def rescale_small_segments(
     amp_floor: float = 1e-4,    # 데드 채널 방지용 바닥값
     gain_max: float = 200.0,    # 최대 증폭률 (0.005 -> 1.0 가능)
     clip: float = 15.0,          # (매우 중요) 증폭된 노이즈를 잘라낼 한계치
+    **kwargs,
 ) -> torch.Tensor:
     x32 = x.float()
     T = x32.shape[-1]
