@@ -61,7 +61,7 @@ CONFIG = {
     "WINDOW_SECONDS": 60,              # 최종 저장 세그먼트 길이 (초)
     "BLOCK_SECONDS": 300,              # 처리 block(core) 길이 (초)
     "CONTEXT_SECONDS": 15.0,           # block 좌우 context 길이 (초)
-    "INITIAL_DISCARD_SECONDS": 5.0,    # 파일 시작부 discard (초)
+    "INITIAL_DISCARD_SECONDS": 10.0,    # 파일 시작부 discard (초)
     "DROP_LAST": True,                 # 60초 미만 자투리 버림
 
     # 채널 최소 요구
