@@ -45,6 +45,7 @@ CUDA_VISIBLE_DEVICES=1 python -m eeg_fm.train_2 \
 --output_dir /mnt/e/checkpoints/test \
 --no_wandb
 """
+_logspec_window_cache = {}
 @torch.no_grad()
 def compute_logspec_view(
     patches: torch.Tensor,   # (N, S) float32
@@ -63,6 +64,11 @@ def compute_logspec_view(
     x = x - x.mean(dim=-1, keepdim=True)
 
     if use_hann:
+        cache_key = (x.shape[-1], x.device, x.dtype)
+        if cache_key not in _logspec_window_cache:
+            _logspec_window_cache[cache_key] = torch.hann_window(
+                x.shape[-1], periodic=True, device=x.device, dtype=x.dtype
+            )
         win = torch.hann_window(x.shape[-1], device=x.device, dtype=x.dtype)
         x = x * win[None, :]
 
@@ -113,9 +119,25 @@ def relational_kl_loss(z: torch.Tensor, s: torch.Tensor, tau_z: float = 0.1, tau
     assert z.dim() == 2 and s.dim() == 2, f"z,s must be 2D, got {z.shape}, {s.shape}"
     assert int(z.shape[0]) == int(s.shape[0]), f"M mismatch: {z.shape[0]} vs {s.shape[0]}"
 
-    log_p = F.log_softmax(pairwise_logits_no_diag(z, tau=tau_z), dim=-1)
-    q = F.softmax(pairwise_logits_no_diag(s, tau=tau_s), dim=-1).detach()
-    return F.kl_div(log_p, q, reduction="batchmean")
+    M = z.shape[0]
+    z_n = F.normalize(z, dim=-1)
+    s_n = F.normalize(s, dim=-1)
+
+    logits_z = (z_n @ z_n.T) / tau_z
+    logits_s = (s_n @ s_n.T) / tau_s
+
+    diag_mask = torch.eye(M, device=z.device, dtype=torch.bool)
+    logits_z = logits_z.masked_fill(diag_mask, float("-inf"))
+    logits_s = logits_s.masked_fill(diag_mask, float("-inf"))
+
+    log_p = F.log_softmax(logits_z, dim=-1)
+    log_q = F.log_softmax(logits_s, dim=-1).detach()
+
+    log_p = log_p.masked_fill(diag_mask, 0.0)
+    log_q = log_q.masked_fill(diag_mask, 0.0)
+
+    loss = F.kl_div(log_p, log_q, reduction="batchmean", log_target=True)
+    return loss
 
 
 # =========================
@@ -482,16 +504,25 @@ def vicreg_var_cov_loss(
     return tot, var, cov
 
 
-def ema_momentum_schedule(step: int, total: int, m0: float, m1: float) -> float:
-    progress = step / max(1, total)
-    m = m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress)))
-    return float(m)
+class EMAUpdater:
+    def __init__(self, teacher: torch.nn.Module, student: torch.nn.Module, m0: float):
+        if hasattr(teacher, "_orig_mod"):
+            teacher = teacher._orig_mod
+        if hasattr(student, "_orig_mod"):
+            student = student._orig_mod
+        self.teacher_params = list(teacher.parameters())
+        self.student_params = list(student.parameters())
+        self.m = m0
+    
+    def ema_momentum_schedule(self, step: int, total: int, m0: float, m1: float):
+        progress = step / max(1, total)
+        m = m1 - (m1 - m0) * (0.5 * (1.0 + math.cos(math.pi * progress)))
+        self.m = float(m)
 
-
-@torch.no_grad()
-def update_ema(teacher: torch.nn.Module, student: torch.nn.Module, m: float):
-    for p_t, p_s in zip(teacher.parameters(), student.parameters()):
-        p_t.data.mul_(m).add_(p_s.data, alpha=(1.0 - m))
+    @torch.no_grad()
+    def update_ema(self):
+        torch._foreach_mul_(self.teacher_params, self.m)
+        torch._foreach_add_(self.teacher_params, self.student_params, alpha = (1.0 - self.m))
 
 
 @torch.no_grad()
@@ -539,23 +570,22 @@ def mask_to_packed_indices(mask: torch.Tensor, valid: torch.Tensor) -> Tuple[tor
 @torch.no_grad()
 def rescale_small_segments(
     x: torch.Tensor,            # (B,C,T) fp16/bf16/fp32
-    target_rms: float = 1.0,
-    rms_low: float = 0.5,
-    rms_floor: float = 0.05,
-    gain_max: float = 8.0,
-    clip: float = 15.0,
+    target_amp: float = 1.0,    # 목표 진폭
+    quantile: float = 0.90,     # 상위 10%를 무시하고 90% 위치의 값을 진폭 기준으로 삼음
+    amp_floor: float = 1e-4,    # 데드 채널 방지용 바닥값
+    gain_max: float = 200.0,    # 최대 증폭률 (0.005 -> 1.0 가능)
+    clip: float = 15.0,          # (매우 중요) 증폭된 노이즈를 잘라낼 한계치
+    **kwargs
 ) -> torch.Tensor:
-    # fp32에서 통계 계산(안정)
     x32 = x.float()
-    # rms = torch.sqrt(torch.mean(x32 * x32, dim=(1,2), keepdim=True) + 1e-8)  # (B,1,1)
-    rms = torch.sqrt(torch.mean(x32 * x32, dim=-1, keepdim=True) + 1e-8)  # (B,C,1)
+    T = x32.shape[-1]
 
-    # rms가 너무 작은 것만 보정
-    need = (rms < rms_low).to(x32.dtype)  # (B,1,1) 0/1
-    gain = (target_rms / rms.clamp_min(rms_floor)).clamp(1.0 / gain_max, gain_max)
+    # kthvalue: introselect 기반 O(T) average — sort 대비 훨씬 빠름
+    k_idx = max(1, int(round(quantile * T)))  # 90th percentile → 0.9*T 번째로 작은 값
+    robust_amp = x32.abs().kthvalue(k_idx, dim=-1, keepdim=True).values  # (B,C,1)
 
-    # need==1인 샘플만 스케일 적용
-    x32 = x32 * (1.0 + need * (gain - 1.0))
+    gain = (target_amp / robust_amp.clamp_min(amp_floor)).clamp(max=gain_max)
+    x32 = x32 * gain
 
     if clip and clip > 0:
         x32 = x32.clamp(-clip, clip)
@@ -1124,7 +1154,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
     )
 
     # accelerate prepare
-    student, teacher, predictor, opt, loader = accelerator.prepare(student, teacher, predictor, opt, loader)
+    student, predictor, opt, loader = accelerator.prepare(student, predictor, opt, loader)
     if spec_align_heads is not None:
         spec_align_heads = accelerator.prepare(spec_align_heads)
     if rel_z_projector is not None:
@@ -1139,15 +1169,33 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
             p.requires_grad = False
         teacher.eval()
 
+    dev = accelerator.device
+    teacher.to(dev)
+
     student_raw = accelerator.unwrap_model(student)
-    teacher_raw = accelerator.unwrap_model(teacher)
     predictor_raw = accelerator.unwrap_model(predictor)
+
+    # ★ torch.compile — teacher deepcopy 이후, accelerator.prepare 이전
+    for blk in student_raw.blocks:
+        if hasattr(blk, 'attn'):
+            blk.attn = torch.compile(blk.attn, mode="default", dynamic=True)
+        if hasattr(blk, 'attn_t'):
+            blk.attn_t = torch.compile(blk.attn_t, mode="default", dynamic=True)
+        if hasattr(blk, 'attn_s'):
+            blk.attn_s = torch.compile(blk.attn_s, mode="default", dynamic=True)
+        if hasattr(blk, 'mlp'):
+            blk.mlp = torch.compile(blk.mlp, mode="default", dynamic=True)
+
+    for blk in predictor_raw.blocks:
+        blk.xattn = torch.compile(blk.xattn, mode="default", dynamic=True)
+        blk.mlp = torch.compile(blk.mlp, mode="default", dynamic=True)
 
     # freq bin centers for masking
     bin_centers = student_raw.freq_feat.bin_centers_hz.detach().cpu()
     student.train()
     predictor.train()
     teacher.eval()
+    ema_updater = EMAUpdater(teacher, student_raw, train_cfg.ema_momentum)
 
     # ---------------------------------
     # accumulation state
@@ -1225,8 +1273,6 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         if (resume_state_dir and lr_sched == "token_wcc")
         else 0
     )
-
-    dev = accelerator.device
 
     pbar = tqdm(total=train_cfg.max_steps, disable=not accelerator.is_local_main_process)
     if resume_state_dir and int(global_step) >= int(train_cfg.max_steps):
@@ -1322,16 +1368,21 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
 
             with record_function("batch.to_device"):
                 x = batch["eeg"].to(dev, non_blocking=True)          # (B,C,T)
+                B = x.shape[0]
+                C_max = batch["C_max_cpu"]
+                P_max = batch["P_max_cpu"]
                 coords = batch["coord"].to(dev, non_blocking=True)   # (B,C,3)
                 n_channels = batch["n_channels"].to(dev, non_blocking=True)
                 n_patches = batch["n_patches"].to(dev, non_blocking=True)
-                target_mask = batch.get("target_mask", None)
-                if target_mask is not None:
-                    target_mask = target_mask.to(dev, non_blocking=True)
+                if "target_mask" in batch:
+                    target_mask = batch["target_mask"].to(dev, non_blocking=True)
+                    context_mask = batch["context_mask"].to(dev, non_blocking=True)
+                else:
+                    target_mask = batch.get("target_mask", None)
+                    if target_mask is not None:
+                        target_mask = target_mask.to(dev, non_blocking=True)
             with record_function("preprocess.rescale"):
                 x = rescale_small_segments(x, target_rms=1.0, rms_low=0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
-            B, C_max, _ = x.shape
-            P_max = int(batch["n_patches"][0].item())
 
             # valid token mask (B,C,P)
             # chan_ok = (torch.arange(C_max, device=x.device)[None, :, None] < n_channels[:, None, None])
@@ -1378,11 +1429,11 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
             if manual_accum:
                 if use_token_budget:
                     if accum_basis == "valid":
-                        tokens_this = int(B) * int(x.shape[1]) * int(P_max)
+                        tokens_this = int(batch["valid_tokens"]) if "valid_tokens" in batch else int(valid.sum().item())
                     elif accum_basis == "context":
-                        tokens_this = int(context_mask.sum().item())
-                    else:  # default: "target"
-                        tokens_this = int(target_mask.sum().item())
+                        tokens_this = int(batch["context_tokens"]) if "context_tokens" in batch else int(context_mask.sum().item())
+                    else:  # target
+                        tokens_this = int(batch["target_tokens"]) if "target_tokens" in batch else int(target_mask.sum().item())
                 else:
                     tokens_this = 1
             else:
@@ -1451,8 +1502,17 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
 
                 # 4) pack indices
                 with record_function("mask.pack"):
-                    c_ctx, t_ctx, pad_ctx = mask_to_packed_indices(context_mask, valid)
-                    c_tgt, t_tgt, pad_tgt = mask_to_packed_indices(target_mask, valid)
+                    # 4) pack indices
+                    if "c_ctx" in batch:
+                        c_ctx = batch["c_ctx"].to(dev, non_blocking=True)
+                        t_ctx = batch["t_ctx"].to(dev, non_blocking=True)
+                        pad_ctx = batch["pad_ctx"].to(dev, non_blocking=True)
+                        c_tgt = batch["c_tgt"].to(dev, non_blocking=True)
+                        t_tgt = batch["t_tgt"].to(dev, non_blocking=True)
+                        pad_tgt = batch["pad_tgt"].to(dev, non_blocking=True)
+                    else:
+                        c_ctx, t_ctx, pad_ctx = mask_to_packed_indices(context_mask, valid)
+                        c_tgt, t_tgt, pad_tgt = mask_to_packed_indices(target_mask, valid)
 
                 with accelerator.autocast():
                     # 5) student: embed+encode context only
@@ -1477,9 +1537,16 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                     # 6) teacher: embed+encode targets only (no corruption)
                     with torch.no_grad():
                         with record_function("teacher.coord_embed"):
-                            coord_ch_teacher = teacher_raw.coord_embed(coords)  # (B,C,D)
+                            coord_ch_teacher = teacher.coord_embed(coords)  # (B,C,D)
+                            # ★ target 패치를 여기서 한 번만 추출 (spec_rel에서 재사용)
+                            if rel_z_projector is not None:
+                                patches_view_t = teacher.extract_patches_view(x)  # VIEW
+                                c_safe_t = c_tgt.clamp(min=0)
+                                t_safe_t = t_tgt.clamp(min=0)
+                                b_idx_t = torch.arange(B, device=x.device)[:, None].expand(B, c_safe_t.shape[1])
+                                _cached_tgt_patches = patches_view_t[b_idx_t, c_safe_t, t_safe_t]  # (B,Lt,S)
                         with record_function("teacher.embed_tgt"):
-                            tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher_raw.embed_from_indices(
+                            tok_tgt, pad_tgt2, rope_tgt, chan_tgt = teacher.embed_from_indices(
                                 x=x,
                                 coords=coords,
                                 c_idx=c_tgt,
@@ -1584,16 +1651,9 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                     spec_rel_loss = None
                     if rel_z_projector is not None:
                         with record_function("loss.spec_rel"):
-                            # target patches -> fixed raw log-spectrum
-                            patches_view = student_raw.extract_patches_view(x)
-                            c_safe = c_tgt.clamp(min=0)
-                            t_safe = t_tgt.clamp(min=0)
-                            B_, Lt = c_safe.shape
-                            b_idx = torch.arange(B_, device=x.device)[:, None].expand(B_, Lt)
-                            patches_tgt = patches_view[b_idx, c_safe, t_safe]
                             valid_tgt = ~pad_tgt
 
-                            patches_flat = patches_tgt[valid_tgt].to(torch.float32)
+                            patches_flat = _cached_tgt_patches[valid_tgt].to(torch.float32)
                             spec_target = compute_logspec_view(
                                 patches_flat,
                                 fs=model_cfg.sample_rate,
@@ -1782,9 +1842,9 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                 if lr_sched == "token_wcc":
                     tokens_seen_total = int(tokens_seen_total) + int(accum_tokens_eff)
 
-                m = ema_momentum_schedule(global_step, ema_total_steps, train_cfg.ema_momentum, train_cfg.ema_momentum_final)
+                ema_updater.ema_momentum_schedule(global_step, ema_total_steps, train_cfg.ema_momentum, train_cfg.ema_momentum_final)
                 with record_function("ema.update"):
-                    update_ema(teacher=teacher_raw, student=student_raw, m=m)
+                    ema_updater.update_ema()
 
                 if accelerator.is_main_process and (global_step % train_cfg.log_every == 0):
                     # bucket key (shape) for this micro-batch (ShapeBatcher guarantees same (C,P) inside micro-batch)
@@ -1808,20 +1868,29 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                         spec_loss = 0.0
                         spec_lam = 0.0
 
+                    log_tensors = torch.stack([
+                        loss_log.detach().float(),
+                        loss_scaled.detach().float(),
+                        grad_norm.detach().float() if grad_norm is not None else torch.zeros((), device=dev),
+                        (~pad_ctx).sum().float(),
+                        (~pad_tgt).sum().float(),
+                        (~pad_ctx).sum(dim=1).max().float(),
+                        (~pad_tgt).sum(dim=1).max().float(),
+                    ]).cpu()
                     logs = {
-                        "loss_tgt_mean": float(loss_log.detach().cpu().item()),
-                        "loss_scaled": float(loss_scaled.detach().cpu().item()),
+                        "loss_tgt_mean": float(log_tensors[0]),
+                        "loss_scaled": float(log_tensors[1]),
                         "lr": lr,
                         "tokens_seen_total": int(tokens_seen_total) if lr_sched == "token_wcc" else 0,
-                        "ema_m": m,
-                        "grad_norm": float(grad_norm.detach().cpu().item()) if grad_norm is not None else 0.0,
+                        "ema_m": ema_updater.m,
+                        "grad_norm": float(log_tensors[2]),
                         "vicreg_loss": float((vic_loss_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
                         "vicreg_var": float((vic_var_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
                         "vicreg_cov": float((vic_cov_sum / vic_w_sum.clamp_min(1e-9)).detach().cpu().item()) if vic_log else 0.0,
-                        "ctx_tokens_max": int((~pad_ctx).sum(dim=1).max().detach().cpu().item()),
-                        "tgt_tokens_max": int((~pad_tgt).sum(dim=1).max().detach().cpu().item()),
-                        "ctx_tokens_sum": int((~pad_ctx).sum().detach().cpu().item()),
-                        "tgt_tokens_sum": int((~pad_tgt).sum().detach().cpu().item()),
+                        "ctx_tokens_max": int(log_tensors[5]),
+                        "tgt_tokens_max": int(log_tensors[6]),
+                        "ctx_tokens_sum": int(log_tensors[3]),
+                        "tgt_tokens_sum": int(log_tensors[4]),
                         "batch_size_samples": int(B),
                         "bucket_C": bucket_C,
                         "bucket_P": bucket_P,
@@ -1879,7 +1948,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
                     if accelerator.is_main_process:
                         student_raw.save_pretrained(os.path.join(ckpt_dir, f"student_{global_step+1:07d}"))
                         torch.save(predictor_raw.state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step+1:07d}.pt"))
-                        teacher_raw.save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step+1:07d}"))
+                        teacher.save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step+1:07d}"))
 
                         _save_trainer_state(
                             os.path.join(ckpt_dir, "trainer_state.json"),
@@ -1944,7 +2013,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, object]:
         os.makedirs(final_dir, exist_ok=True)
         student_raw.save_pretrained(os.path.join(final_dir, "student"))
         torch.save(predictor_raw.state_dict(), os.path.join(final_dir, "predictor.pt"))
-        teacher_raw.save_pretrained(os.path.join(final_dir, "teacher"))
+        teacher.save_pretrained(os.path.join(final_dir, "teacher"))
         _save_trainer_state(
             os.path.join(final_dir, "trainer_state.json"),
             global_step_next=global_step,
