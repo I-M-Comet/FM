@@ -12,7 +12,7 @@ Features
 
 Example
 -------
-python summarize_runs.py --metrics A4_1_runs_metrics.jsonl --lp eval_A4_1_lp_results.csv --output output.txt
+python summarize_runs.py --metrics B0_2_runs_metrics.jsonl --lp eval_B0_2_lp_results.csv --output output.txt
 python summarize_eeg_runs.py \
   --metrics /mnt/data/A3_6_runs_metrics.jsonl \
   --lp /mnt/data/eval_A3_6_lp_results.csv \
